@@ -1,10 +1,13 @@
 //! lisp :)
 //!
 //! a lot of this is taken from risp (https://stopa.io/post/222)
+//!
+//! there are a few notable differences though, the main ones
+//! being that it's styled like racket and lazily evaluates
 
 use std::{collections::HashMap, io, str::Chars};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum AsylExpr {
 	Symbol(String),
 	String(String),

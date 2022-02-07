@@ -49,6 +49,9 @@ fn main() {
 			Event::MessageCreate(message) => {
 				debug!("{} <{}> {}", channel_name(state.find_channel(message.channel_id)), message.author.name, message.content);
 				// attempt to parse the message
+				let tokens = parse::tokenize(message.content);
+				let parse = parse::parse(&tokens);
+				debug!("{:?}", parse);
 			},
 			_ => {}
 		}
