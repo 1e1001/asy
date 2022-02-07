@@ -4,15 +4,16 @@
 
 use std::{collections::HashMap, io, str::Chars};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum AsylExpr {
 	Symbol(String),
 	String(String),
 	Float(f64),
 	Int(i64),
-	UInt(u64),
+	Uint(u64),
 	Bool(bool),
 	List(Vec<AsylExpr>),
+	ExtFn(fn(&[AsylExpr]) -> Result<AsylExpr, AsylError>),
 }
 
 #[derive(Debug)]
@@ -21,6 +22,7 @@ enum AsylError {
 	UnexpectedEOF,
 	InvalidEscape,
 	UnexpectedCloseParen,
+	InvalidNumber,
 }
 
 type AsylResult<T> = Result<T, AsylError>;
@@ -33,9 +35,6 @@ struct AsylEnv {
 enum AsylToken {
 	Symbol(String),
 	String(String),
-	Float(f64),
-	Int(i64),
-	UInt(u64),
 	Paren(bool),
 }
 
@@ -192,9 +191,7 @@ fn parse<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])>
 		AsylToken::Paren(false) => {
 			Err(AsylError::UnexpectedCloseParen)
 		},
-		token => {
-			Ok((parse_atom(token), rest))
-		},
+		token => Ok((parse_atom(token)?, rest)),
 	}
 }
 
@@ -214,8 +211,173 @@ fn read_seq<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken
 	}
 }
 
-fn parse_atom<'a>(token: AsylToken) -> AsylExpr {
+fn is_number(data: &str) -> bool {
+	match data[0] {
+		'0'|'1'|'2'|'3'|'4'|'5'|'6'|'7'|'8'|'9' => true,
+		'-'|'+' => {
+			if data.len() > 0 {
+				is_number(data[1..])
+			} else {
+				false
+			}
+		}, _ => false,
+	}
+}
+
+fn char_val(c: char, radix: u8) -> AsylResult<u8> {
+	let val = match c {
+		'0' => 0,
+		'1' => 1,
+		'2' => 2,
+		'3' => 3,
+		'4' => 4,
+		'5' => 5,
+		'6' => 6,
+		'7' => 7,
+		'8' => 8,
+		'9' => 9,
+		'a'|'A' => 10,
+		'b'|'B' => 11,
+		'c'|'C' => 12,
+		'd'|'D' => 13,
+		'e'|'E' => 14,
+		'f'|'F' => 15,
+		_ => return Err(AsylError::InvalidNumber)
+	};
+	if val < radix {Ok(val)} else {Err(AsylError::InvalidNumber)}
+}
+
+fn parse_number(data: &str) -> AsylResult<AsylExpr> {
+	// i hope we can put it here
+	enum ParseState {
+		IntSign, IntBase, Int, Frac, ExpSign, Exp,
+	}
+	let mut state = ParseState::IntSign;
+	let mut base = 10;
+	let mut base_max = 20;
+	let mut int = 0u64;
+	let mut int_len = 0u8;
+	let mut int_neg = false;
+	let mut frac = 0u64;
+	let mut frac_len = 0u8;
+	let mut exp = 0u64;
+	let mut exp_len = 0u8;
+	let mut exp_neg = false;
+	// i could rewrite this as a consume-y thingy like the tokenizer but i dont feel like it
+	for ch in data.chars() {
+		match ParseState {
+			ParseState::IntSign => match ch {
+				'+' => {},
+				'-' => int_neg = !int_neg;
+				'0' => state = ParseState::IntBase,
+				o => {
+					state = ParseState::Int;
+					int = char_val(o, base)? as u64;
+					int_len = 1;
+				},
+			},
+			ParseState::IntBase => match ch {
+				'x' => {
+					state = ParseState::Int;
+					base = 16;
+					base_max = 16;
+				},
+				'b' => {
+					state = ParseState::Int;
+					base = 2;
+					base_max = 64;
+				},
+				o => {
+					state = ParseState::Int;
+					int = char_val(o, base)? as u64;
+					int_len = 1;
+				},
+			},
+			ParseState::Int => match ch {
+				'_'|',' => {},
+				'.' if base == 10 => state = ParseState::Frac,
+				'e'|'E' if base == 10 => state = ParseState::ExpSign,
+				o => {
+					if int_len >= base_max {
+						return Err(AsylError::InvalidNumber);
+					}
+					int <<= base;
+					int |= char_val(o, base)? as u64;
+					int_len += 1;
+				},
+			},
+			ParseState::Frac => match ch {
+				'_'|',' => {},
+				'e' => state = ParseState::ExpSign,
+				o => {
+					if frac_len >= 20 {
+						return Err(AsylError::InvalidNumber);
+					}
+					frac <<= 10;
+					frac |= char_val(o, 10)? as u64;
+					frac_len += 1;
+				},
+			},
+			ParseState::ExpSign => match ch {
+				'+' => {},
+				'-' => exp_neg = !exp_neg,
+				'_'|',' => state = ParseState::Exp,
+				o => {
+					state = ParseState::Exp;
+					exp = char_val(o, 10)? as u64;
+					exp_len = 1;
+				}
+			},
+			ParseState::Exp => match ch {
+				'_'|',' => {},
+				o => {
+					if exp_len >= 4 {
+						return Err(AsylError::InvalidNumber);
+					}
+					exp <<= 10;
+					exp |= char_val(o, 10)? as u64;
+					exp_len += 1;
+				},
+			},
+		}
+	}
+	// and now, every sanity check in existance
+	match state {
+		ParseState::IntSign => Err(AsylError::InvalidNumber),
+		ParseState::IntBase => Ok(AsylExpr::Uint(0)),
+		ParseState::Int => if int_len > 0 {
+			if int_neg {
+				if int <= 0x1000000000000000u64 {
+					AsylExpr::Int(-int as i64)
+				} else {
+					Err(AsylError::InvalidNumber)
+				}
+			} else {
+				AsylExpr::Uint(int)
+			}
+		} else {
+			Err(AsylError::InvalidNumber)
+		},
+		ParseState::Frac => if int_len > 0{
+			Ok(AsylExpr::Float((int as f64) + (frac as f64) / (10.0.powi(frac_len))))
+		} else {
+			Err(AsylError::InvalidNumber)
+		},
+		ParseState::ExpSign => Err(AsylError::InvalidNumber),
+		ParseState::Exp => if int_len > 0 && exp_len > 0 {
+			let frac = (int as f64) + (frac as f64) / (10.0.powi(frac_len));
+			Ok(AsylExpr::Float(frac * 10.0.powi(exp)))
+		}
+	}
+}
+
+fn parse_atom(token: AsylToken) -> AsylResult<AsylExpr> {
 	match token {
-		// todo here
+		AsylToken::String(data) => AsylExpr::String(data),
+		AsylToken::Symbol(data) => if is_number(&data) {
+			parse_number(&data)
+		} else {
+			Ok(AsylExpr::Symbol(data))
+		}
 	}
 }
