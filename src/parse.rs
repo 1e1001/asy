@@ -1,3 +1,7 @@
+//! lisp :)
+//!
+//! a lot of this is taken from risp (https://stopa.io/post/222)
+
 use std::{collections::HashMap, io, str::Chars};
 
 #[derive(Debug, Clone)]
@@ -16,6 +20,7 @@ enum AsylError {
 	Other(String),
 	UnexpectedEOF,
 	InvalidEscape,
+	UnexpectedCloseParen,
 }
 
 type AsylResult<T> = Result<T, AsylError>;
@@ -178,4 +183,39 @@ fn tokenize(data: String) -> AsylResult<Vec<AsylToken>> {
 		}
 	}
 	Ok(out)
+}
+
+fn parse<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
+	let (token, rest) = tokens.split_first().ok_or(AsylError::UnexpectedEOF)?;
+	match token {
+		AsylToken::Paren(true) => read_seq(rest),
+		AsylToken::Paren(false) => {
+			Err(AsylError::UnexpectedCloseParen)
+		},
+		token => {
+			Ok((parse_atom(token), rest))
+		},
+	}
+}
+
+fn read_seq<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
+	let mut res = vec![];
+	let mut xs = tokens;
+	loop {
+		let (token, rest) = xs.split_first().ok_or(AsylError::UnexpectedEOF)?;
+		match token {
+			AsylToken::Paren(false) => return Ok((AsylExpr::List(res), rest)),
+			_ => {
+				let (exp, new_xs) = parse(&rest)?;
+				res.push(exp);
+				xs = new_xs;
+			}
+		}
+	}
+}
+
+fn parse_atom<'a>(token: AsylToken) -> AsylExpr {
+	match token {
+		// todo here
+	}
 }
