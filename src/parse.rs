@@ -27,9 +27,15 @@ enum AsylError {
 
 type AsylResult<T> = Result<T, AsylError>;
 
+enum AsylEnvEntry {
+	// probably also some scope information here
+	Lazy(AsylExpr),
+	Evaluated(AsylExpr),
+}
+
 #[derive(Clone)]
 struct AsylEnv {
-	data: HashMap<String, AsylExpr>,
+	data: HashMap<String, AsynEnvEntry>,
 }
 
 enum AsylToken {
