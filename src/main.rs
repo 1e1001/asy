@@ -1,7 +1,11 @@
+#![feature(generators, generator_trait)]
+
 use std::fs;
 
 use discord::{Discord, State, ChannelRef, model::Event};
 use log::{error, warn, debug, info};
+
+mod parse;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EnvData {

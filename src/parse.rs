@@ -1,19 +1,27 @@
+use std::{collections::HashMap, io, str::Chars};
+
 #[derive(Debug, Clone)]
-enum ALExpr {
+enum AsylExpr {
 	Symbol(String),
 	String(String),
 	Float(f64),
 	Int(i64),
 	UInt(u64),
-	List(Vec<Expr>),
+	List(Vec<AsylExpr>),
 }
 
 #[derive(Debug)]
-enum ALError {
+enum AsylError {
 	Other(String),
 }
 
 #[derive(Clone)]
-struct ALEnv {
-	data: HashMap<String, AlExpr>,
+struct AsylEnv {
+	data: HashMap<String, AsylExpr>,
+}
+
+fn parse(data: String) -> Vec<AsylExpr> {
+	let iter = data.chars();
+	let out = vec![];
+	out
 }
