@@ -1,5 +1,3 @@
-#![feature(generators, generator_trait)]
-
 use std::fs;
 
 use discord::{Discord, State, ChannelRef, model::Event};
