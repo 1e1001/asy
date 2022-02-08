@@ -10,6 +10,8 @@ use std::{error, fmt};
 
 use crate::utils::safe_string;
 
+// todo: make this wrapped in a span
+// im not doing this on web since i'm bound to miss something
 #[derive(Clone)]
 pub enum AsylExpr {
 	Symbol(String),
@@ -21,6 +23,13 @@ pub enum AsylExpr {
 	List(Vec<AsylExpr>),
 	ExtFn(fn(&[AsylExpr]) -> Result<AsylExpr, AsylError>),
 }
+
+// char, line, col
+#[derive(Debug)]
+pub struct AsylPos(usize, usize, usize);
+// start, len
+#[derive(Debug)]
+pub struct AsylSpan(AsylPos, usize);
 
 impl fmt::Display for AsylExpr {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -43,12 +52,16 @@ impl fmt::Debug for AsylExpr {
 	}
 }
 
+// todo: add asylspan's to most of these
 #[derive(Debug)]
 pub enum AsylError {
+	// no span because it's literally just eof
 	UnexpectedEOF,
-	InvalidEscape(String),
-	UnexpectedCloseParen(usize),
+	InvalidEscape(String, AsylSpan),
+	UnexpectedCloseParen(AsylSpan),
+	// span this
 	InvalidNumber(String),
+	// runtime errors: span these
 	ExpectedNumber,
 	TypeMismatch,
 	ConvertFailure,
@@ -228,7 +241,7 @@ pub enum AsylToken {
 }
 
 #[derive(Debug)]
-pub struct AsylTraceToken(AsylToken, usize);
+pub struct Spanned<T>(T, AsylSpan);
 
 enum StartQuoteType {
 	Quote,
@@ -271,8 +284,16 @@ fn char_type(c: char) -> CharType {
 }
 
 // haven't tested this, good luck future me
-pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
-	let mut iter = data.chars().enumerate().peekable();
+pub fn tokenize(data: &str) -> AsylResult<Vec<Spanned<AsylToken>>> {
+	let mut line = 1;
+	let mut col = 1;
+	let mut iter = data.chars().enumerate().map(|i, v| {
+		match v {
+			'\n' => { col = 1; line += 1; },
+			_ => { col += 1; }
+		}
+		(AsylPos(i, line, col), v)
+	}).peekable();
 	let mut out = vec![];
 	loop {
 		let (chi, ch) = match iter.next() {
@@ -280,7 +301,7 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 			None => break,
 		};
 		match ch {
-			CharType::Paren(v) => out.push(AsylTraceToken(AsylToken::Paren(v), chi)),
+			CharType::Paren(v) => out.push(Spanned(AsylToken::Paren(v), AsylSpan(chi, 1))),
 			CharType::Comment => {
 				// discord until eol or eof
 				while match iter.next() {
@@ -293,51 +314,58 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 				let end = t.other_side();
 				// string parsing
 				let mut res = String::new();
+				let mut len = 1;
 				loop {
+					len += 1;
 					match iter.next() {
 						None => return Err(AsylError::UnexpectedEOF),
-						Some((_, ch)) => match ch {
+						Some((chi, ch)) => match ch {
 							// escapes
 							// shorthands: \n \t \r \a \e \0
 							// codes:      \xHH \{code}
 							// literals:   \#
-							'\\' => match iter.next().and_then(|v| Some(v.1)) {
-								None => return Err(AsylError::UnexpectedEOF),
-								Some('n') => res.push('\n'),
-								Some('t') => res.push('\t'),
-								Some('r') => res.push('\r'),
-								Some('a') => res.push('\x07'),
-								Some('e') => res.push('\x1b'),
-								Some('0') => res.push('\x00'),
-								Some('x') => {
-									let mut t = String::new();
-									t.push(iter.next().ok_or(AsylError::UnexpectedEOF)?.1);
-									t.push(iter.next().ok_or(AsylError::UnexpectedEOF)?.1);
-									let mut buf = [0u8; 1];
-									hex::decode_to_slice(&t, &mut buf).or_else(|_| Err(AsylError::InvalidEscape(format!("\\x{}", t))))?;
-									res.push(char::from(buf[0]));
-								},
-								Some('{') => {
-									// unicode parsing :(
-									let mut esc = String::new();
-									loop { // 3rd level nested loop :)
-										if esc.len() > 8 { return Err(AsylError::InvalidEscape(format!("\\{{{}", esc))); }
-										match iter.next() {
-											None => return Err(AsylError::UnexpectedEOF),
-											Some((_, '}')) => break,
-											Some((_, ch)) => esc.push(ch),
+							'\\' => {
+								len += 1
+								match iter.next().and_then(|v| Some(v.1)) {
+									None => return Err(AsylError::UnexpectedEOF),
+									Some('n') => res.push('\n'),
+									Some('t') => res.push('\t'),
+									Some('r') => res.push('\r'),
+									Some('a') => res.push('\x07'),
+									Some('e') => res.push('\x1b'),
+									Some('0') => res.push('\x00'),
+									Some('x') => {
+										let mut t = String::new();
+										len += 2;
+										t.push(iter.next().ok_or(AsylError::UnexpectedEOF)?.1);
+										t.push(iter.next().ok_or(AsylError::UnexpectedEOF)?.1);
+										let mut buf = [0u8; 1];
+										hex::decode_to_slice(&t, &mut buf).or_else(|_| Err(AsylError::InvalidEscape(format!("\\x{}", t), AsylSpan(chi, 1))))?;
+										res.push(char::from(buf[0]));
+									},
+									Some('{') => {
+										// unicode parsing :(
+										let mut esc = String::new();
+										loop { // 3rd level nested loop :)
+											if esc.len() > 8 { return Err(AsylError::InvalidEscape(format!("\\{{{}", esc), AsylSpan(chi, 1))); }
+											len += 1;
+											match iter.next() {
+												None => return Err(AsylError::UnexpectedEOF),
+												Some((_, '}')) => break,
+												Some((_, ch)) => esc.push(ch),
+											}
 										}
-									}
-									// append 0's so it's 8 byte in size
-									while esc.len() < 8 {
-										esc.insert(0, '0');
-									}
-									// “`char` is always four bytes in size.”
-									let mut buf = [0u8; 4];
-									hex::decode_to_slice(&esc, &mut buf).or_else(|_| Err(AsylError::InvalidEscape(format!("\\{{{}", esc))))?;
-									res.push(char::from_u32(u32::from_be_bytes(buf)).ok_or_else(|| AsylError::InvalidEscape(format!("\\{{{}", esc)))?);
-								},
-								Some(tc) => res.push(tc),
+										// append 0's so it's 8 byte in size
+										while esc.len() < 8 {
+											esc.insert(0, '0');
+										}
+										// “`char` is always four bytes in size.”
+										let mut buf = [0u8; 4];
+										hex::decode_to_slice(&esc, &mut buf).or_else(|_| Err(AsylError::InvalidEscape(format!("\\{{{}", esc), AsylSpan(chi, 1))))?;
+										res.push(char::from_u32(u32::from_be_bytes(buf)).ok_or_else(|| AsylError::InvalidEscape(format!("\\{{{}", esc), AsylSpan(chi, 1)))?);
+									},
+									Some(tc) => res.push(tc),
+								}
 							},
 							ch => {
 								if ch == end {
@@ -349,11 +377,12 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 						}
 					}
 				}
-				out.push(AsylTraceToken(AsylToken::String(res), chi));
+				out.push(Spanned(AsylToken::String(res), AsylSpan(chi, len)));
 			},
 			CharType::Other(ch) => {
 				// consume until it's not other
 				let mut res = String::from(ch);
+				let mut len = 0;
 				loop {
 					match iter.peek() {
 						None => break,
@@ -362,10 +391,11 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 							_ => break,
 						}
 					}
+					len += 1;
 					// we know this value so we discard it
 					iter.next();
 				}
-				out.push(AsylTraceToken(AsylToken::Symbol(res), chi));
+				out.push(Spanned(AsylToken::Symbol(res), AsylSpan(chi, len)));
 			},
 			CharType::Whitespace => {},
 		}
@@ -373,7 +403,7 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 	Ok(out)
 }
 
-pub fn parse_all(tokens: &[AsylTraceToken]) -> AsylResult<Vec<AsylExpr>> {
+pub fn parse_all(tokens: &[Spanned<AsylToken>]) -> AsylResult<Vec<AsylExpr>> {
 	let mut out = vec![];
 	let mut rest = tokens;
 	while rest.len() > 0 {
@@ -384,7 +414,7 @@ pub fn parse_all(tokens: &[AsylTraceToken]) -> AsylResult<Vec<AsylExpr>> {
 	Ok(out)
 }
 
-fn parse<'a>(tokens: &'a [AsylTraceToken]) -> AsylResult<(AsylExpr, &'a [AsylTraceToken])> {
+fn parse<'a>(tokens: &'a [Spanned<AsylToken>]) -> AsylResult<(AsylExpr, &'a [Spanned<AsylToken>])> {
 	let (token, rest) = tokens.split_first().ok_or(AsylError::UnexpectedEOF)?;
 	match &token.0 {
 		AsylToken::Paren(true) => read_seq(rest),
@@ -400,7 +430,7 @@ fn parse<'a>(tokens: &'a [AsylTraceToken]) -> AsylResult<(AsylExpr, &'a [AsylTra
 	}
 }
 
-fn read_seq<'a>(tokens: &'a [AsylTraceToken]) -> AsylResult<(AsylExpr, &'a [AsylTraceToken])> {
+fn read_seq<'a>(tokens: &'a [Spanned<AsylToken>]) -> AsylResult<(AsylExpr, &'a [Spanned<AsylToken>])> {
 	let mut res = vec![];
 	let mut xs = tokens;
 	loop {
