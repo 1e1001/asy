@@ -26,14 +26,20 @@ impl fmt::Display for AsylExpr {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&match self {
 			AsylExpr::Symbol(v) => v.clone(),
-			AsylExpr::String(v) => v.clone(),
+			AsylExpr::String(v) => format!("{:?}", v),
 			AsylExpr::Float(v) => v.to_string(),
 			AsylExpr::Int(v) => v.to_string(),
 			AsylExpr::Uint(v) => v.to_string(),
-			AsylExpr::Bool(v) => if *v {"true"} else {"false"}.to_string(),
+			AsylExpr::Bool(v) => if *v {"#t"} else {"#f"}.to_string(),
 			AsylExpr::List(v) => format!("({})", v.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")),
-			AsylExpr::ExtFn(v) => "<ExtFn>".to_string(),
+			AsylExpr::ExtFn(_) => "<ExtFn>".to_string(),
 		})
+	}
+}
+
+impl fmt::Debug for AsylExpr {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_fmt(format_args!("{}", self))
 	}
 }
 
@@ -44,20 +50,26 @@ pub enum AsylError {
 	UnexpectedCloseParen(usize),
 	InvalidNumber(String),
 	ExpectedNumber,
+	TypeMismatch,
 	ConvertFailure,
 	ArgMismatch(String),
+	NotDefined(String),
+	InvalidCall,
 }
 
 impl fmt::Display for AsylError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&match self {
-			AsylError::UnexpectedEOF => "Unexpected End-of-file in input".to_string(),
-			AsylError::InvalidEscape(text) => format!("Invalid escape sequence `{}`", safe_string(text)),
+			AsylError::UnexpectedEOF => "Unexpected end of input".to_string(),
+			AsylError::InvalidEscape(text) => format!("Invalid escape sequence \\`{}\\`", safe_string(text)),
 			AsylError::UnexpectedCloseParen(index) => format!("Unexpected `)` at position {}", index),
-			AsylError::InvalidNumber(text) => format!("Invalid number `{}`", safe_string(text)),
+			AsylError::InvalidNumber(text) => format!("Invalid number \\`{}\\`", safe_string(text)),
 			AsylError::ExpectedNumber => "Expected number".to_string(),
 			AsylError::ConvertFailure => "Conversion Failure".to_string(),
 			AsylError::ArgMismatch(text) => format!("Argument mismatch, expected {}", text),
+			AsylError::NotDefined(text) => format!("\\`{}\\` isn't defined", safe_string(text)),
+			AsylError::InvalidCall => "Invalid call".to_string(),
+			AsylError::TypeMismatch => "Type mismatch".to_string(),
 		})
 	}
 }
@@ -65,19 +77,12 @@ impl fmt::Display for AsylError {
 impl error::Error for AsylError {}
 
 type AsylResult<T> = Result<T, AsylError>;
-
-#[derive(Clone)]
-pub enum AsylEnvEntry {
-	// probably also some scope information here
-	Lazy(AsylExpr),
-	Evaluated(AsylExpr),
-}
-
 #[derive(Clone)]
 pub struct AsylEnv {
-	data: HashMap<String, AsylEnvEntry>,
+	data: HashMap<String, AsylExpr>,
 }
 
+#[derive(Debug)]
 enum UniformNumberList {
 	Float(Vec<f64>),
 	Int(Vec<i64>),
@@ -85,17 +90,6 @@ enum UniformNumberList {
 }
 
 fn to_uniform_number_list(list: &[AsylExpr]) -> AsylResult<UniformNumberList> {
-	enum NumberType {
-		Float, Int, Uint
-	}
-	fn number_type(v: &AsylExpr) -> AsylResult<NumberType> {
-		Ok(match v {
-			AsylExpr::Float(_) => NumberType::Float,
-			AsylExpr::Int(_) => NumberType::Int,
-			AsylExpr::Uint(_) => NumberType::Uint,
-			_ => return Err(AsylError::ExpectedNumber),
-		})
-	}
 	macro_rules! res {
 		(dir, $v:expr, $typ:ty) => {$v};
 		(cas, $v:expr, $typ:ty) => {$v as $typ};
@@ -103,7 +97,7 @@ fn to_uniform_number_list(list: &[AsylExpr]) -> AsylResult<UniformNumberList> {
 	macro_rules! collect {
 		($typ:ty, $list:expr, $float:tt $int:tt $uint:tt) => {{
 			let mut out = vec![];
-			for i in &$list[1..] {
+			for i in $list {
 				out.push(match i {
 					AsylExpr::Float(v) => res!($float, *v, $typ),
 					AsylExpr::Int(v)   => res!($int,   *v, $typ),
@@ -126,31 +120,103 @@ fn to_uniform_number_list(list: &[AsylExpr]) -> AsylResult<UniformNumberList> {
 	}
 	Ok(match list[0] {
 		AsylExpr::Float(_) => UniformNumberList::Float(collect!(f64, list, dir cas cas)?),
-		AsylExpr::Int(_) => UniformNumberList::Int(collect!(i64, list,   cas dir cas)?),
-		AsylExpr::Uint(_) => UniformNumberList::Uint(collect!(u64, list,  cas cas dir)?),
+		AsylExpr::Int(_)   => UniformNumberList::Int(collect!(i64, list,   cas dir cas)?),
+		AsylExpr::Uint(_)  => UniformNumberList::Uint(collect!(u64, list,  cas cas dir)?),
 		_ => return Err(AsylError::ExpectedNumber),
 	})
 }
 
+macro_rules! tonicity_internal {
+	($ty:ty, $name:tt, $check_fn:expr) => {
+		fn $name(p: &$ty, n: &[$ty]) -> bool {
+			match n.first() {
+				Some(v) => $check_fn(p, v) && $name(v, &n[1..]),
+				None => true,
+			}
+		}
+	};
+}
+
+// this is clever, so i'm stealing it :)
+macro_rules! ensure_tonicity {
+	($check_fn:expr) => {
+		|args| {
+			if args.len() < 2 {
+				return Err(AsylError::ArgMismatch("at least two arguments".to_string()))
+			}
+			tonicity_internal!(f64, f_f64, $check_fn);
+			tonicity_internal!(i64, f_i64, $check_fn);
+			tonicity_internal!(u64, f_u64, $check_fn);
+			Ok(AsylExpr::Bool(match to_uniform_number_list(args)? {
+				UniformNumberList::Float(v) => f_f64(&v[0], &v[1..]),
+				UniformNumberList::Int(v)   => f_i64(&v[0], &v[1..]),
+				UniformNumberList::Uint(v)  => f_u64(&v[0], &v[1..]),
+			}))
+		}
+	};
+}
+
+macro_rules! ast {
+	($val:expr, $ty:tt) => {
+		if let AsylExpr::$ty(v) = $val {
+			Ok(v)
+		} else {
+			Err(AsylError::TypeMismatch)
+		}
+	}
+}
+
 pub fn default_env() -> AsylEnv {
 	let mut data = HashMap::new();
-	data.insert("+".to_string(), AsylEnvEntry::Evaluated(AsylExpr::ExtFn(|args| {
+	data.insert("+".to_string(), AsylExpr::ExtFn(|args| {
+		if args.len() < 1 {
+			return Err(AsylError::ArgMismatch("at least one argument".to_string()))
+		}
 		Ok(match to_uniform_number_list(args)? {
 			UniformNumberList::Float(v) => AsylExpr::Float(v.iter().fold(0.0, |a, b| a + b)),
 			UniformNumberList::Int(v)   => AsylExpr::Int(  v.iter().fold(0, |a, b| a + b)),
 			UniformNumberList::Uint(v)  => AsylExpr::Uint( v.iter().fold(0, |a, b| a + b)),
 		})
-	})));
-	data.insert("-".to_string(), AsylEnvEntry::Evaluated(AsylExpr::ExtFn(|args| {
+	}));
+	data.insert("-".to_string(), AsylExpr::ExtFn(|args| {
 		if args.len() < 2 {
 			return Err(AsylError::ArgMismatch("at least two arguments".to_string()))
 		}
 		Ok(match to_uniform_number_list(args)? {
 			UniformNumberList::Float(v) => AsylExpr::Float(v[0] - v[1..].iter().fold(0.0, |a, b| a + b)),
 			UniformNumberList::Int(v)   => AsylExpr::Int(  v[0] - v[1..].iter().fold(0, |a, b| a + b)),
-			UniformNumberList::Uint(v)  => AsylExpr::Uint( v[0] - v[1..].iter().fold(0, |a, b| a + b)),
+			UniformNumberList::Uint(v)  => {
+				let sum = v[1..].iter().fold(0, |a, b| a + b);
+				let first = v[0];
+				if sum > first {
+					AsylExpr::Int(-((sum - first) as i64))
+				} else {
+					AsylExpr::Uint(first - sum)
+				}
+			},
 		})
-	})));
+	}));
+	data.insert("'f".to_string(), AsylExpr::Bool(false));
+	data.insert("'t".to_string(), AsylExpr::Bool(true));
+	data.insert("'n".to_string(), AsylExpr::List(vec![]));
+	data.insert(">".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a > b)));
+	data.insert("=".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a == b)));
+	data.insert(">=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a >= b)));
+	data.insert("<".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a < b)));
+	data.insert("!=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a != b)));
+	data.insert("<=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a <= b)));
+	data.insert("&&".to_string(), AsylExpr::ExtFn(|args| Ok(AsylExpr::Bool(args.iter().map(|v| ast!(v, Bool)).collect::<AsylResult<Vec<_>>>()?.iter().fold(true, |a, b| a && **b)))));
+	data.insert("||".to_string(), AsylExpr::ExtFn(|args| Ok(AsylExpr::Bool(args.iter().map(|v| ast!(v, Bool)).collect::<AsylResult<Vec<_>>>()?.iter().fold(false, |a, b| a || **b)))));
+	data.insert("^^".to_string(), AsylExpr::ExtFn(|args| Ok(AsylExpr::Bool(args.iter().map(|v| ast!(v, Bool)).collect::<AsylResult<Vec<_>>>()?.iter().fold(false, |a, b| if **b {!a} else {a})))));
+	data.insert("!".to_string(), AsylExpr::ExtFn(|args| {
+		if args.len() != 1 {
+			return Err(AsylError::ArgMismatch("one argument".to_string()))
+		}
+		match args[0] {
+			AsylExpr::Bool(v) => Ok(AsylExpr::Bool(!v)),
+			_ => Err(AsylError::TypeMismatch),
+		}
+	}));
 	AsylEnv { data }
 }
 
@@ -218,7 +284,7 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 			CharType::Comment => {
 				// discord until eol or eof
 				while match iter.next() {
-					None => true,
+					None => false,
 					Some((_, '\n')) => false,
 					Some(_) => true,
 				} {}
@@ -307,7 +373,18 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<AsylTraceToken>> {
 	Ok(out)
 }
 
-pub fn parse<'a>(tokens: &'a [AsylTraceToken]) -> AsylResult<(AsylExpr, &'a [AsylTraceToken])> {
+pub fn parse_all(tokens: &[AsylTraceToken]) -> AsylResult<Vec<AsylExpr>> {
+	let mut out = vec![];
+	let mut rest = tokens;
+	while rest.len() > 0 {
+		let (token, new_rest) = parse(rest)?;
+		out.push(token);
+		rest = new_rest;
+	}
+	Ok(out)
+}
+
+fn parse<'a>(tokens: &'a [AsylTraceToken]) -> AsylResult<(AsylExpr, &'a [AsylTraceToken])> {
 	let (token, rest) = tokens.split_first().ok_or(AsylError::UnexpectedEOF)?;
 	match &token.0 {
 		AsylToken::Paren(true) => read_seq(rest),
@@ -500,5 +577,23 @@ fn parse_number(data: &str) -> AsylResult<AsylExpr> {
 		} else {
 			Err(AsylError::InvalidNumber(data.to_string()))
 		}
+	}
+}
+
+pub fn eval(exp: &AsylExpr, env: &mut AsylEnv) -> AsylResult<AsylExpr> {
+	match exp {
+		AsylExpr::Symbol(v) => env.data.get(v).ok_or_else(|| AsylError::NotDefined(v.clone())).map(|i| i.clone()),
+		AsylExpr::List(list) => {
+			let first = list.first().ok_or(AsylError::InvalidCall)?;
+			let args = &list[1..];
+			match eval(first, env)? {
+				AsylExpr::ExtFn(f) => {
+					let args_eval: AsylResult<Vec<_>> = args.iter().map(|x| eval(x, env)).collect();
+					f(&args_eval?)
+				},
+				_ => Err(AsylError::InvalidCall)
+			}
+		},
+		other => Ok(other.clone())
 	}
 }

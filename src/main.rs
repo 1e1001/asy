@@ -1,13 +1,14 @@
 #![feature(trace_macros)]
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use log::{info, error};
+use log::{info, error, debug};
 use serenity::Client;
 use serenity::client::{EventHandler, Context};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::TypeMapKey;
+use tokio::sync::RwLock;
 
 mod lisp;
 mod utils;
@@ -30,17 +31,19 @@ struct EnvData {
 
 pub struct GlobalData {
 	user_id: u64,
+	env: lisp::AsylEnv,
 }
 
 impl GlobalData {
 	fn new() -> Self {
 		Self {
 			user_id: 0,
+			env: lisp::default_env(),
 		}
 	}
 }
 impl TypeMapKey for GlobalData {
-	type Value = Arc<Mutex<GlobalData>>;
+	type Value = Arc<RwLock<GlobalData>>;
 }
 
 pub struct Handler;
@@ -61,58 +64,49 @@ macro_rules! handler {
 	};
 }
 
-fn loose_check(c: Option<char>) -> bool {
-	match match c {
-		Some(c) => c,
-		None => ' ',
-	} {
-		'('|')' => true,
-		'['|']' => true,
-		'{'|'}' => true,
-		_ => false,
-	}
+async fn get_data(ctx: &Context) -> Arc<RwLock<GlobalData>> {
+	let data = ctx.data.read().await;
+	data.get::<GlobalData>().unwrap().clone()
 }
 
 handler! {
 	async fn message(context: Context, msg: Message) {
-		if msg.author.id == this.ready.as_ref().unwrap().user.id { return }
-		if msg.content.chars().count() > 2 {
-			let mut content_chars = msg.content.chars();
-			let first = content_chars.next();
-			let last = content_chars.last();
-			if loose_check(first) && loose_check(last) {
-				match match lisp::tokenize(&msg.content) {
-					Ok(tokens) => {
-						match lisp::parse(&tokens) {
-							Ok((parse, rest)) => {
-								if rest.len() == 0 {
-									Some(format!("{}", parse))
-								} else {
-									None
+		if msg.author.id == get_data(&context).await.read().await.user_id { return }
+		if msg.content.len() > 0 && msg.content.as_bytes()[0] == b'$' {
+			match match lisp::tokenize(&msg.content[1..]) {
+				Ok(tokens) => match lisp::parse_all(&tokens) {
+					Ok(parse) => {
+						let lock = get_data(&context).await;
+						let env = &mut lock.write().await.env;
+						Some(parse
+							.iter()
+							.map(|i| {
+								match lisp::eval(i, env) {
+									Ok(v) => format!("{}", v),
+									Err(v) => format!("<Error: {}>", v),
 								}
-							},
-							Err(err) => Some(format!("parse error\n{:?}", err)),
-						}
+							}).collect::<Vec<_>>().join(" "))
 					},
-					Err(err) => Some(format!("token error\n{:?}", err))
-				} {
-					Some(v) => {
-						if let Err(err) = msg.reply_ping(&context.http, v).await {
-							error!("message error: {}", err);
-						}
-					},
-					None => {},
-				}
+					Err(err) => Some(format!("Error during parsing: \n{}", err)),
+				},
+				Err(err) => Some(format!("Error during tokenizing: \n{}", err))
+			} {
+				Some(v) => {
+					if let Err(err) = msg.reply_ping(&context.http, v).await {
+						error!("message error: {}", err);
+					}
+				},
+				None => {},
 			}
 		}
 	}
 	async fn ready(context: Context, ready: Ready) {
 		info!("logged in as {}", ready.user.name);
 		{
-			let data = context.data.read().await;
-			data.get::<GlobalData>().unwrap().clone();
+			let lock = get_data(&context).await;
+			let mut global_data = lock.write().await;
+			global_data.user_id = ready.user.id.0;
 		}
-		// todo here
 	}
 }
 
@@ -130,7 +124,7 @@ async fn main() {
 		.expect("client fail");
 	{
 		let mut data = client.data.write().await;
-		data.insert::<GlobalData>(Arc::new(Mutex::new(GlobalData::new())))
+		data.insert::<GlobalData>(Arc::new(RwLock::new(GlobalData::new())))
 	}
 	if let Err(err) = client.start().await {
 		error!("client: {:?}", err);
