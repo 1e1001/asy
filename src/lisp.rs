@@ -185,9 +185,16 @@ impl error::Error for AsylError {}
 
 type AsylResult<T> = Result<T, AsylError>;
 #[derive(Clone)]
+pub enum AsylEnvEntry {
+	// once you've just defined something
+	Unevaluated(Spanned<AsylExpr>),
+	// if you use a value
+	Evaluated(Spanned<AsylExpr>),
+}
+#[derive(Clone)]
 pub struct AsylEnv<'a> {
-	data: HashMap<String, Spanned<AsylExpr>>,
-	parent: Option<&'a AsylEnv<'a>>,
+	data: HashMap<String, AsylEnvEntry>,
+	parent: Option<&'a mut AsylEnv<'a>>,
 }
 
 #[derive(Debug)]
@@ -385,8 +392,7 @@ pub fn default_env() -> AsylEnv {
 	envi!(data, "def", AsylExpr::ExtFn(|this, env, args| {
 		asal!(this, args, 2..=2, "two arguments");
 		let name = ast!(this, args[0], Symbol, "'symbol")?;
-		let value = eval(&args[0], env)?;
-		env.data.insert(name, value);
+		env.data.insert(name, AsylEnvEntry::Unevaluated(args[1].clone()));
 		Ok(args[0].clone())
 	}));
 	envi!(data, "fn", AsylExpr::ExtFn(|this, env, args| {
@@ -802,26 +808,38 @@ fn eval_args(args: &[Spanned<AsylExpr>], env: &mut AsylEnv) -> AsylResult<Vec<Sp
 	args.iter().map(|x| eval(x, env)).collect()
 }
 
-fn lookup_var(name: &str, env: &AsyLEnv) -> Option<Spanned<AsylExpr>> {
+fn lookup_var(span: AsylSpan, name: &str, env: &mut AsylEnv) -> AsylResult<Spanned<AsylExpr>> {
 	match env.data.get(name) {
-		Some(v) => Some(v.clone()),
+		Some(v) => match v {
+			AsylEnvEntry::Unevaluated(exp) => {
+				let exp_eval = eval(&exp, env)?;
+				env.insert(name.clone(), AsylEnvEntry::Evaluated(exp_eval));
+				Ok(exp_eval)
+			},
+			AsylEnvEntry::Evaluated(exp) => Ok(exp),
+		},
 		None => match env.parent {
 			Some(parent) => lookup_var(name, parent),
-			None => None
+			None => Err(AsylError::NotDefined(span, name.clone())),
 		}
 	}
 }
 
 // this feels like the kind of thing that'd just desugar into like (lambda-exec lambda . args)
-fn lambda_env(span: AsylSpan, args: &[String], env: &AsylEnv, arg_vals: &[AsylExpr]) -> AsylResult<AsylEnv> {
+fn lambda_env(span: AsylSpan, args: &[String], parent: &mut AsylEnv, arg_vals: &[AsylExpr]) -> AsylResult<AsylEnv> {
 	if arg_vals.len() != args.len() {
 		Err(AsylError::ArgMismatch(span, format!("{} argument(s)", arg_vals.len())))
 	}
+	let mut data = HashMap::new();
+	for (k, v) in args.iter().zip(arg_vals.iter()) {
+		data.insert(k.clone(), AsylEnvEntry::Unevaluated(v.clone()));
+	}
+	Ok(AsylEnv { data, parent })
 }
 
 pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<AsylExpr>> {
 	match &exp.0 {
-		AsylExpr::Symbol(v) => lookup_var(v, env).ok_or_else(|| AsylError::NotDefined(exp.1, v.clone())),
+		AsylExpr::Symbol(v) => lookup_var(exp.1, v, env),
 		AsylExpr::List(list) => {
 			let first = list.first().ok_or(AsylError::InvalidCall(exp.1))?;
 			let args = &list[1..];
@@ -834,7 +852,10 @@ pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<As
 					let new_env = lambda_env(exp.1, f.args, env, args)?;
 					eval(&f.body, &mut new_env)
 				},
-				_ => Err(AsylError::InvalidCall(exp.1))
+				// shorthand for force-evaluating something
+				// for instance (define var 12) returns var
+				// but ((define var 12)) returns 12
+				other => eval(other, env),
 			}
 		},
 		other => Ok(Spanned(other.clone(), exp.1))
