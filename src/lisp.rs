@@ -11,18 +11,51 @@ use std::{error, fmt, iter};
 
 use crate::utils::safe_string;
 
-// todo: make this wrapped in a span
-// im not doing this on web since i'm bound to miss something
+#[derive(Clone)]
+pub enum AsylType {
+	Symbol, String, Float, Int, Bool, Type, List, Fn
+}
+pub struct AsylLambda {
+	// i dont think these need to be rc'd but suuure
+	// i can most likely get away with boxing these
+	// i'll try that when i get home
+	args: Rc<Vec<String>>,
+	body: Rc<Spanned<AsylExpr>>,
+}
 #[derive(Clone)]
 pub enum AsylExpr {
 	Symbol(String),
 	String(String),
 	Float(f64),
 	Int(i64),
-	Uint(u64),
 	Bool(bool),
+	Type(AsylType),
+	// list structures for consideration:
+	// - just a vec :(
+	// - snap's hybrid linked/unlinked lists
+	//   - maybe have contiguous spans of memory be represented as vecs
+	//     a linked list of lists
+	// - VList
+	//   - probably a slightly better implementation of that snap hybrid list
 	List(Vec<Spanned<AsylExpr>>),
 	ExtFn(fn(AsylSpan, &mut AsylEnv, &[Spanned<AsylExpr>]) -> Result<Spanned<AsylExpr>, AsylError>),
+	Lambda(AsylLambda),
+}
+
+impl AsylExpr {
+	fn get_type(&self) -> AsylType {
+		match self {
+			AsylExpr::Symbol(_) => AsylType::Symbol,
+			AsylExpr::String(_) => AsylType::String,
+			AsylExpr::Float(_)  => AsylType::Float,
+			AsylExpr::Int(_)    => AsylType::Int,
+			AsylExpr::Bool(_)   => AsylType::Bool,
+			AsylExpr::Type(_)   => AsylType::Type,
+			AsylExpr::List(_)   => AsylType::List,
+			AsylExpr::ExtFn(_)  => AsylType::Fn,
+			AsylExpr::Lambda(_) => AsylType::Fn,
+		}
+	}
 }
 
 // char, line, col
@@ -39,7 +72,7 @@ impl AsylInSpan {
 		let mut cols_until_start = self.0.2 - 1;
 		let mut line = self.0.1;
 		let mut current_col = 1;
-		writeln!(out, "{}:{}:{}", source_name, self.0.1, self.0.2)?;
+		writeln!(out, "{}:{}", source_name, self.0.1)?;
 		write!(out, "{:>6} | ", line)?;
 		let mut count = self.1;
 		for (_, ch) in source.chars().chain(iter::once('\n')).skip(self.0.0 + 1 - self.0.2).enumerate() {
@@ -79,10 +112,11 @@ impl fmt::Display for AsylExpr {
 			AsylExpr::String(v) => format!("{:?}", v),
 			AsylExpr::Float(v) => v.to_string(),
 			AsylExpr::Int(v) => v.to_string(),
-			AsylExpr::Uint(v) => v.to_string(),
+			// technically 't and 'f are just variables but i don't care
 			AsylExpr::Bool(v) => if *v {"'t"} else {"'f"}.to_string(),
 			AsylExpr::List(v) => format!("({})", v.iter().map(|v| v.0.to_string()).collect::<Vec<_>>().join(" ")),
-			AsylExpr::ExtFn(_) => "<ExtFn>".to_string(),
+			AsylExpr::ExtFn(_) => "<proc>".to_string(),
+			AsylExpr::Lambda(_) => "<proc>".to_string(),
 		})
 	}
 }
@@ -93,7 +127,7 @@ impl fmt::Debug for AsylExpr {
 	}
 }
 
-// todo: add asylspan's to most of these
+// todo: replace the strings with more specific details (a range, asyltype, etc)
 #[derive(Debug)]
 pub enum AsylError {
 	// no span because it's literally just eof
@@ -106,6 +140,7 @@ pub enum AsylError {
 	ArgMismatch(AsylSpan, String),
 	NotDefined(AsylSpan, String),
 	InvalidCall(AsylSpan),
+	Shit,
 }
 
 impl fmt::Display for AsylError {
@@ -119,6 +154,7 @@ impl fmt::Display for AsylError {
 			AsylError::NotDefined(_, text) => format!("\\`{}\\` isn't defined", safe_string(text)),
 			AsylError::InvalidCall(_) => "Invalid call".to_string(),
 			AsylError::TypeMismatch(_, text) => format!("Type mismatch, expected {}", text),
+			AsylError::Shit() => "not implemented".to_string(),
 		})
 	}
 }
@@ -134,6 +170,7 @@ impl AsylError {
 			AsylError::ArgMismatch(s, _) => s,
 			AsylError::NotDefined(s, _) => s,
 			AsylError::InvalidCall(s) => s,
+			AsylError::Shit => None,
 		}
 	}
 	pub fn print_span(&self, source_name: &str, source: &str) -> String {
@@ -148,31 +185,30 @@ impl error::Error for AsylError {}
 
 type AsylResult<T> = Result<T, AsylError>;
 #[derive(Clone)]
-pub struct AsylEnv {
-	data: HashMap<String, AsylExpr>,
+pub struct AsylEnv<'a> {
+	data: HashMap<String, Spanned<AsylExpr>>,
+	parent: Option<&'a AsylEnv<'a>>,
 }
 
 #[derive(Debug)]
 enum UniformNumberList {
 	Float(Vec<f64>),
 	Int(Vec<i64>),
-	Uint(Vec<u64>),
 }
 
 fn to_uniform_number_list(list: &[Spanned<AsylExpr>]) -> AsylResult<UniformNumberList> {
 	#[derive(PartialEq, Eq, PartialOrd, Ord)]
 	enum NumType {
-		Float, Int, Uint
+		Float, Int
 	}
 	fn num_type(v: &Spanned<AsylExpr>) -> AsylResult<NumType> {
 		match v.0 {
 			AsylExpr::Float(_) => Ok(NumType::Float),
 			AsylExpr::Int(_)   => Ok(NumType::Int),
-			AsylExpr::Uint(_)  => Ok(NumType::Uint),
-			_ => Err(AsylError::TypeMismatch(v.1, "'float, 'int, or 'uint".to_string()))
+			_ => Err(AsylError::TypeMismatch(v.1, "'float or 'int".to_string()))
 		}
 	}
-	let mut best = NumType::Uint;
+	let mut best = NumType::Int;
 	// 1. find the best type that fits
 	for i in list {
 		let new_type = num_type(i)?;
@@ -181,23 +217,21 @@ fn to_uniform_number_list(list: &[Spanned<AsylExpr>]) -> AsylResult<UniformNumbe
 		}
 	}
 	macro_rules! parse_list {
-		($typ:ty, $res:tt, $a:tt, $uint:expr$(, $int:expr$(, $float:expr)?)?) => {{
+		($typ:ty, $res:tt, $a:tt, $int:expr$(, $float:expr)?) => {{
 			let mut res = vec![];
 			for i in list {
 				res.push(match i.0 {
-					AsylExpr::Uint($a)    => $uint,
-					$(AsylExpr::Int($a)   => $int,
+					AsylExpr::Int($a)   => $int,
 					$(AsylExpr::Float($a) => $float,
-					)?)? _ => unreachable!(),
+					)? _ => unreachable!(),
 				});
 			}
 			Ok(UniformNumberList::$res(res))
 		}}
 	}
 	match best {
-		NumType::Float => parse_list!(f64, Float, a, a as f64, a as f64, a),
-		NumType::Int   => parse_list!(i64, Int,   a, a as i64, a),
-		NumType::Uint  => parse_list!(u64, Uint,  a, a),
+		NumType::Float => parse_list!(f64, Float, a, a as f64, a),
+		NumType::Int   => parse_list!(i64, Int,   a, a),
 	}
 }
 
@@ -217,16 +251,12 @@ macro_rules! ensure_tonicity {
 	($check_fn:expr) => {
 		|this, env, args| {
 			let args = eval_args(args, env)?;
-			if args.len() < 2 {
-				return Err(AsylError::ArgMismatch(this, "at least two arguments".to_string()))
-			}
+			asal!(this, args, 1.., "at least one argument");
 			tonicity_internal!(f64, f_f64, $check_fn);
 			tonicity_internal!(i64, f_i64, $check_fn);
-			tonicity_internal!(u64, f_u64, $check_fn);
 			Ok(Spanned(AsylExpr::Bool(match to_uniform_number_list(&args)? {
 				UniformNumberList::Float(v) => f_f64(&v[0], &v[1..]),
 				UniformNumberList::Int(v)   => f_i64(&v[0], &v[1..]),
-				UniformNumberList::Uint(v)  => f_u64(&v[0], &v[1..]),
 			}), this))
 		}
 	};
@@ -234,7 +264,7 @@ macro_rules! ensure_tonicity {
 
 macro_rules! ast {
 	($this:expr, $val:expr, $ty:tt, $ty_str:expr) => {
-		if let AsylExpr::$ty(v) = $val {
+		if let AsylExpr::$ty(v) = $val.0 {
 			Ok(v)
 		} else {
 			Err(AsylError::TypeMismatch($this, $ty_str.to_string()))
@@ -242,105 +272,137 @@ macro_rules! ast {
 	}
 }
 
+macro_rules! asal {
+	($this:expr, $args:expr, $range:expr, $msg:expr) => {
+		if !$range.contains($args.len()) {
+			return Err(AsylError::ArgMismatch($this, $msg))
+		}
+	}
+}
+
+macro_rules! envi {
+	($env:expr, $name:expr, $value:expr) => {
+		$env.insert($name.to_string(), Spanned($value, None))
+	}
+}
+
 pub fn default_env() -> AsylEnv {
 	let mut data = HashMap::new();
-	data.insert("+".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	// maths
+	envi!(data, "+", AsylExpr::ExtFn(|this, env, args| {
 		let args = eval_args(args, env)?;
-		if args.len() < 1 {
-			return Err(AsylError::ArgMismatch(this, "at least one argument".to_string()))
-		}
+		asal!(this, args, 1.., "at least one argument");
 		Ok(Spanned(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExpr::Float(v.iter().fold(0.0, |a, b| a + b)),
 			UniformNumberList::Int(v)   => AsylExpr::Int(  v.iter().fold(0, |a, b| a + b)),
-			UniformNumberList::Uint(v)  => AsylExpr::Uint( v.iter().fold(0, |a, b| a + b)),
 		}, this))
 	}));
-	data.insert("*".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	envi!(data, "*", AsylExpr::ExtFn(|this, env, args| {
 		let args = eval_args(args, env)?;
-		if args.len() < 1 {
-			return Err(AsylError::ArgMismatch(this, "at least one argument".to_string()))
-		}
+		asal!(this, args, 1.., "at least one argument");
 		Ok(Spanned(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExpr::Float(v.iter().fold(1.0, |a, b| a * b)),
 			UniformNumberList::Int(v)   => AsylExpr::Int(  v.iter().fold(1, |a, b| a * b)),
-			UniformNumberList::Uint(v)  => AsylExpr::Uint( v.iter().fold(1, |a, b| a * b)),
 		}, this))
 	}));
-	data.insert("-".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	envi!(data, "-", AsylExpr::ExtFn(|this, env, args| {
 		let args = eval_args(args, env)?;
-		if args.len() < 2 {
-			return Err(AsylError::ArgMismatch(this, "at least two arguments".to_string()))
-		}
+		asal!(this, args, 2.., "at least two arguments");
 		Ok(Spanned(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExpr::Float(v[0] - v[1..].iter().fold(0.0, |a, b| a + b)),
 			UniformNumberList::Int(v)   => AsylExpr::Int(  v[0] - v[1..].iter().fold(0, |a, b| a + b)),
-			UniformNumberList::Uint(v)  => {
-				let sum = v[1..].iter().fold(0, |a, b| a + b);
-				let first = v[0];
-				if sum > first {
-					AsylExpr::Int(-((sum - first) as i64))
-				} else {
-					AsylExpr::Uint(first - sum)
-				}
-			},
 		}, this))
 	}));
-	data.insert("'f".to_string(), AsylExpr::Bool(false));
-	data.insert("'t".to_string(), AsylExpr::Bool(true));
-	data.insert("'n".to_string(), AsylExpr::List(vec![]));
-	data.insert(">".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a > b)));
-	data.insert("=".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a == b)));
-	data.insert(">=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a >= b)));
-	data.insert("<".to_string(),  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a < b)));
-	data.insert("!=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a != b)));
-	data.insert("<=".to_string(), AsylExpr::ExtFn(ensure_tonicity!(|a, b| a <= b)));
-	data.insert("&&".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	// ' isn't quoting in this lang and # is used by discord
+	envi!(data, "'f", AsylExpr::Bool(false));
+	envi!(data, "'t", AsylExpr::Bool(true));
+	envi!(data, "'n", AsylExpr::List(vec![]));
+	// types
+	envi!(data, "'symbol", AsylExpr::Type(AsylType::Symbol));
+	envi!(data, "'string", AsylExpr::Type(AsylType::String));
+	envi!(data, "'float",  AsylExpr::Type(AsylType::Float));
+	envi!(data, "'int",    AsylExpr::Type(AsylType::Int));
+	envi!(data, "'bool",   AsylExpr::Type(AsylType::Bool));
+	envi!(data, "'type",   AsylExpr::Type(AsylType::Type));
+	envi!(data, "'list",   AsylExpr::Type(AsylType::List));
+	envi!(data, "'fn",     AsylExpr::Type(AsylType::Fn));
+	// comparisons
+	envi!(data, ">",  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a > b)));
+	envi!(data, "=",  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a == b)));
+	envi!(data, ">=", AsylExpr::ExtFn(ensure_tonicity!(|a, b| a >= b)));
+	envi!(data, "<",  AsylExpr::ExtFn(ensure_tonicity!(|a, b| a < b)));
+	envi!(data, "!=", AsylExpr::ExtFn(ensure_tonicity!(|a, b| a != b)));
+	envi!(data, "<=", AsylExpr::ExtFn(ensure_tonicity!(|a, b| a <= b)));
+	// logical joiners
+	envi!(data, "&&", AsylExpr::ExtFn(|this, env, args| {
 		for arg in args {
 			let res = eval(arg, env)?;
-			if ast!(this, res.0, Bool, "'bool")? == false {
+			if ast!(this, res, Bool, "'bool")? == false {
 				return Ok(Spanned(AsylExpr::Bool(false), this))
 			}
 		}
 		Ok(Spanned(AsylExpr::Bool(true), this))
 	}));
-	data.insert("||".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	envi!(data, "||", AsylExpr::ExtFn(|this, env, args| {
 		for arg in args {
 			let res = eval(arg, env)?;
-			if ast!(this, res.0, Bool, "'bool")? == true {
+			if ast!(this, res, Bool, "'bool")? == true {
 				return Ok(Spanned(AsylExpr::Bool(true), this))
 			}
 		}
 		Ok(Spanned(AsylExpr::Bool(false), this))
 	}));
-	data.insert("^^".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	envi!(data, "^^", AsylExpr::ExtFn(|this, env, args| {
 		let args = eval_args(args, env)?;
 		Ok(Spanned(AsylExpr::Bool(
 			args
 			.iter()
-			.map(|v| ast!(this, v.0, Bool, "'bool"))
+			.map(|v| ast!(this, v, Bool, "'bool"))
 			.collect::<AsylResult<Vec<_>>>()?
 			.iter()
 			.fold(false, |a, b| if *b {!a} else {a})
 		), this))
 	}));
-	data.insert("!".to_string(), AsylExpr::ExtFn(|this, env, args| {
+	envi!(data, "!", AsylExpr::ExtFn(|this, env, args| {
 		let args = eval_args(args, env)?;
-		if args.len() != 1 {
-			return Err(AsylError::ArgMismatch(this, "one argument".to_string()))
-		}
-		match args[0].0 {
-			AsylExpr::Bool(v) => Ok(Spanned(AsylExpr::Bool(!v), this)),
-			_ => Err(AsylError::TypeMismatch(this, "'bool".to_string())),
-		}
+		asal!(this, args, 1..=1, "one argument");
+		Ok(Spanned(AsylExpr::Bool(!ast!(this, args[0], Bool, "'bool")?), this))
 	}));
-	data.insert("if".to_string(), AsylExpr::ExtFn(|this, env, args| {
-		if ast!(this, eval(&args[0], env)?.0, Bool, "'bool")? {
+	// typeof operator
+	envi!(data, "'", AsylExpr::ExtFn(|this, env, args| {
+		asal!(this, args, 1..=1, "one argument");
+		return Ok(AsylExpr::Type(args[0].get_type()))
+	}));
+	envi!(data, "if", AsylExpr::ExtFn(|this, env, args| {
+		asal!(this, args, 3..=3, "three arguments");
+		if ast!(this, eval(&args[0], env)?, Bool, "'bool")? {
 			eval(&args[1], env)
 		} else {
 			eval(&args[2], env)
 		}
 	}));
-	AsylEnv { data }
+	// i like def and fn over define and lambda, so i'm using those
+	envi!(data, "def", AsylExpr::ExtFn(|this, env, args| {
+		asal!(this, args, 2..=2, "two arguments");
+		let name = ast!(this, args[0], Symbol, "'symbol")?;
+		let value = eval(&args[0], env)?;
+		env.data.insert(name, value);
+		Ok(args[0].clone())
+	}));
+	envi!(data, "fn", AsylExpr::ExtFn(|this, env, args| {
+		// asal!(this, args, 2.., "at least two arguments");
+		asal!(this, args, 2..=2, "two arguments");
+		let args_exprs = ast!(this, args[0], List, "'list")?;
+		let lambda_args = vec![];
+		for arg in args_exprs {
+			lambda_args.push(ast!(this, arg, Symbol, "'symbol")?);
+		}
+		Ok(Spanned(AsylExpr::Lambda(AsylLambda {
+			args: Rc::new(lambda_args),
+			body: Rc::new(args[1].clone()),
+		}), this))
+	}));
+	AsylEnv { data, parent: None }
 }
 
 #[derive(Debug)]
@@ -705,7 +767,7 @@ fn parse_number(data: &str, span: AsylSpan) -> AsylResult<Spanned<AsylExpr>> {
 	// and now, every sanity check in existance
 	match state {
 		ParseState::IntSign => Err(AsylError::InvalidNumber(span, data.to_string())),
-		ParseState::IntBase => Ok(Spanned(AsylExpr::Uint(0), span)),
+		ParseState::IntBase => Ok(Spanned(AsylExpr::Int(0), span)),
 		ParseState::Int => if int_len > 0 {
 			if int_neg {
 				if int <= 0x1000000000000000u64 {
@@ -713,8 +775,10 @@ fn parse_number(data: &str, span: AsylSpan) -> AsylResult<Spanned<AsylExpr>> {
 				} else {
 					Err(AsylError::InvalidNumber(span, data.to_string()))
 				}
+			} else if int < 0x1000000000000000u64 {
+				Ok(Spanned(AsylExpr::Int(int as i64), span))
 			} else {
-				Ok(Spanned(AsylExpr::Uint(int), span))
+				Err(AsylError::InvalidNumber(span, data.to_string()))
 			}
 		} else {
 			Err(AsylError::InvalidNumber(span, data.to_string()))
@@ -738,9 +802,26 @@ fn eval_args(args: &[Spanned<AsylExpr>], env: &mut AsylEnv) -> AsylResult<Vec<Sp
 	args.iter().map(|x| eval(x, env)).collect()
 }
 
+fn lookup_var(name: &str, env: &AsyLEnv) -> Option<Spanned<AsylExpr>> {
+	match env.data.get(name) {
+		Some(v) => Some(v.clone()),
+		None => match env.parent {
+			Some(parent) => lookup_var(name, parent),
+			None => None
+		}
+	}
+}
+
+// this feels like the kind of thing that'd just desugar into like (lambda-exec lambda . args)
+fn lambda_env(span: AsylSpan, args: &[String], env: &AsylEnv, arg_vals: &[AsylExpr]) -> AsylResult<AsylEnv> {
+	if arg_vals.len() != args.len() {
+		Err(AsylError::ArgMismatch(span, format!("{} argument(s)", arg_vals.len())))
+	}
+}
+
 pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<AsylExpr>> {
 	match &exp.0 {
-		AsylExpr::Symbol(v) => env.data.get(v).ok_or_else(|| AsylError::NotDefined(exp.1, v.clone())).map(|i| Spanned(i.clone(), None)),
+		AsylExpr::Symbol(v) => lookup_var(v, env).ok_or_else(|| AsylError::NotDefined(exp.1, v.clone())),
 		AsylExpr::List(list) => {
 			let first = list.first().ok_or(AsylError::InvalidCall(exp.1))?;
 			let args = &list[1..];
@@ -748,6 +829,10 @@ pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<As
 			match res.0 {
 				AsylExpr::ExtFn(f) => {
 					Ok(f(exp.1, env, args)?)
+				},
+				AsylExpr::Lambda(f) => {
+					let new_env = lambda_env(exp.1, f.args, env, args)?;
+					eval(&f.body, &mut new_env)
 				},
 				_ => Err(AsylError::InvalidCall(exp.1))
 			}

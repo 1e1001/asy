@@ -47,10 +47,10 @@ impl TypeMapKey for GlobalData {
 
 pub struct Handler;
 
-// trace_macros!(true);
-
+// force rust-analyzer to autocomplete my async trait
+// probably the best macro i've ever made
 macro_rules! handler {
-	($(async fn $name:tt ($($arg:tt: $val:tt),*) $code:tt)+) => {
+	($(async fn $name:tt ($($arg:tt: $val:tt),*) $code:block)+) => {
 		mod handler_impl {
 			use super::*;
 			$(pub async fn $name($($arg: $val),*) $code)+
@@ -74,6 +74,8 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 			Ok(parse) => {
 				let lock = get_data(&context).await;
 				let env = &mut lock.write().await.env;
+				// also get some sort of user env here?
+				// we need nested envs before that though
 				let mut errors = vec![];
 				let mut res = parse
 					.iter()
