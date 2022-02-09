@@ -15,17 +15,17 @@ pub fn safe_string(t: &str) -> String {
 }
 
 pub fn print_arg_range(r: impl RangeBounds<usize>) -> String {
-    let (start, end) = match r.start_bound() {
+    let (start, end, end_exclude) = match r.start_bound() {
         Bound::Excluded(_) => panic!("invalid range"),
         Bound::Included(start) => match r.end_bound() {
-            Bound::Excluded(end) => (Some(*start), Some(end - 1)),
-            Bound::Included(end) => (Some(*start), Some(*end)),
-            Bound::Unbounded => (Some(*start), None),
+            Bound::Excluded(end) => (Some(*start), Some(*end), true),
+            Bound::Included(end) => (Some(*start), Some(end + 1), false),
+            Bound::Unbounded => (Some(*start), None, false),
         },
         Bound::Unbounded => match r.end_bound() {
-            Bound::Excluded(end) => (None, Some(end - 1)),
-            Bound::Included(end) => (None, Some(*end)),
-            Bound::Unbounded => (None, None),
+            Bound::Excluded(end) => (None, Some(*end), true),
+            Bound::Included(end) => (None, Some(end + 1), false),
+            Bound::Unbounded => (None, None, false),
         },
     };
     match start {
@@ -33,12 +33,20 @@ pub fn print_arg_range(r: impl RangeBounds<usize>) -> String {
             Some(end) => if start == end {
                 format!("{} argument{}", start, if start == 1 {""} else {"s"})
             } else {
-                format!("{} to {} arguments", start, end)
+                format!("{} to {} arguments", start, end - 1)
             },
             None => format!("at least {} argument{}", start, if start == 1 {""} else {"s"}),
         },
         None => match end {
-            Some(end) => format!("at most {} argument{}", end, if end == 1 {""} else {"s"}),
+            Some(end) => if end_exclude {
+				if end == 1 {
+					format!("0 arguments")
+				} else {
+					format!("less than {} argument{}", end, if end == 1 {""} else {"s"})
+				}
+			} else {
+				format!("at most {} argument{}", end - 1, if end == 2 {""} else {"s"})
+			},
             None => "any number of arguments".to_string(),
         },
     }
