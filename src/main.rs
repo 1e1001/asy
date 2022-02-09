@@ -18,6 +18,7 @@ struct EnvData {
 	owner: u64,
 }
 
+// old code, could be useful someday
 // fn channel_name(ch: Option<ChannelRef>) -> String {
 // 	match ch {
 // 		Some(ChannelRef::Public(server, channel)) => format!("{}#{}", server.name, channel.name),
@@ -74,7 +75,7 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 			Ok(parse) => {
 				let lock = get_data(&context).await;
 				let env = &mut lock.write().await.env;
-				// also get some sort of user env here?
+				// todo: get some sort of user env here?
 				// we need nested envs before that though
 				let mut errors = vec![];
 				let mut res = parse

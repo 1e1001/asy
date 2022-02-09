@@ -16,12 +16,14 @@ pub enum AsylType {
 	Symbol, String, Float, Int, Bool, Type, List, Fn
 }
 pub struct AsylLambda {
+	// todo
 	// i dont think these need to be rc'd but suuure
 	// i can most likely get away with boxing these
 	// i'll try that when i get home
 	args: Rc<Vec<String>>,
 	body: Rc<Spanned<AsylExpr>>,
 }
+// string interning could be nice here, probably implemented as an Rc<String>?
 #[derive(Clone)]
 pub enum AsylExpr {
 	Symbol(String),
@@ -30,6 +32,7 @@ pub enum AsylExpr {
 	Int(i64),
 	Bool(bool),
 	Type(AsylType),
+	// todo
 	// list structures for consideration:
 	// - just a vec :(
 	// - snap's hybrid linked/unlinked lists
@@ -130,12 +133,10 @@ impl fmt::Debug for AsylExpr {
 // todo: replace the strings with more specific details (a range, asyltype, etc)
 #[derive(Debug)]
 pub enum AsylError {
-	// no span because it's literally just eof
 	UnexpectedEOF,
 	InvalidEscape(AsylSpan, String),
 	UnexpectedCloseParen(AsylSpan),
 	InvalidNumber(AsylSpan, String),
-	// runtime errors: span these
 	TypeMismatch(AsylSpan, String),
 	ArgMismatch(AsylSpan, String),
 	NotDefined(AsylSpan, String),
@@ -216,7 +217,6 @@ fn to_uniform_number_list(list: &[Spanned<AsylExpr>]) -> AsylResult<UniformNumbe
 		}
 	}
 	let mut best = NumType::Int;
-	// 1. find the best type that fits
 	for i in list {
 		let new_type = num_type(i)?;
 		if new_type < best {
@@ -396,6 +396,7 @@ pub fn default_env() -> AsylEnv {
 		Ok(args[0].clone())
 	}));
 	envi!(data, "fn", AsylExpr::ExtFn(|this, env, args| {
+		// todo: add a begin op and support more than 2 args here
 		// asal!(this, args, 2.., "at least two arguments");
 		asal!(this, args, 2..=2, "two arguments");
 		let args_exprs = ast!(this, args[0], List, "'list")?;
@@ -461,7 +462,6 @@ fn char_type(c: char) -> CharType {
 	}
 }
 
-// haven't tested this, good luck future me
 pub fn tokenize(data: &str) -> AsylResult<Vec<Spanned<AsylToken>>> {
 	let mut line = 1;
 	let mut col = 1;
@@ -529,6 +529,7 @@ pub fn tokenize(data: &str) -> AsylResult<Vec<Spanned<AsylToken>>> {
 											if esc.len() > 8 { return Err(AsylError::InvalidEscape(Some(AsylInSpan(chi, 2 + esc.len())), format!("\\{{{}", esc))); }
 											len += 1;
 											match iter.next() {
+												// 12 levels of indent oh no
 												None => return Err(AsylError::UnexpectedEOF),
 												Some((_, '}')) => break,
 												Some((_, ch)) => esc.push(ch),
@@ -677,7 +678,6 @@ fn char_val(c: char, radix: u8) -> Option<u8> {
 
 fn parse_number(data: &str, span: AsylSpan) -> AsylResult<Spanned<AsylExpr>> {
 	let asyl_error = || AsylError::InvalidNumber(span, data.to_string());
-	// i hope we can put it here
 	enum ParseState {
 		IntSign, IntBase, Int, Frac, ExpSign, Exp,
 	}
@@ -837,6 +837,7 @@ fn lambda_env(span: AsylSpan, args: &[String], parent: &mut AsylEnv, arg_vals: &
 	Ok(AsylEnv { data, parent })
 }
 
+// todo: tail recursion optimization
 pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<AsylExpr>> {
 	match &exp.0 {
 		AsylExpr::Symbol(v) => lookup_var(exp.1, v, env),
@@ -852,7 +853,7 @@ pub fn eval(exp: &Spanned<AsylExpr>, env: &mut AsylEnv) -> AsylResult<Spanned<As
 					let new_env = lambda_env(exp.1, f.args, env, args)?;
 					eval(&f.body, &mut new_env)
 				},
-				// shorthand for force-evaluating something
+				// shorthand for an identity / force function
 				// for instance (define var 12) returns var
 				// but ((define var 12)) returns 12
 				other => eval(other, env),
