@@ -2,7 +2,6 @@
 use std::fs;
 use std::sync::Arc;
 
-use log::{info, error, debug};
 use serenity::Client;
 use serenity::client::{EventHandler, Context};
 use serenity::model::channel::Message;
@@ -69,39 +68,66 @@ async fn get_data(ctx: &Context) -> Arc<RwLock<GlobalData>> {
 	data.get::<GlobalData>().unwrap().clone()
 }
 
+async fn eval_print(context: &Context, msg: &Message, text: &str) {
+	match match lisp::tokenize(text) {
+		Ok(tokens) => match lisp::parse_all(&tokens) {
+			Ok(parse) => {
+				let lock = get_data(&context).await;
+				let env = &mut lock.write().await.env;
+				let mut errors = vec![];
+				let mut res = parse
+					.iter()
+					.map(|i| {
+						match lisp::eval(i, env) {
+							Ok(v) => v.0.to_string(),
+							Err(v) => { errors.push(v); "<error>".to_string() },
+						}
+					})
+					.collect::<Vec<_>>().join(" ");
+				if errors.len() > 0 {
+					res.push_str("\nerrors:\n");
+					for i in errors {
+						res.push_str(&format!("{}{}", i, i.print_span(&msg.author.name, text)));
+					}
+				}
+				Some(res)
+			},
+			Err(err) => Some(format!("Error during parsing:\n{}{}", err, err.print_span(&msg.author.name, text))),
+		},
+		Err(err) => Some(format!("Error during tokenizing:\n{}{}", err, err.print_span(&msg.author.name, text)))
+	} {
+		Some(v) => {
+			if let Err(err) = msg.reply_ping(&context.http, v).await {
+				log::error!("message error: {}", err);
+			}
+		},
+		None => {},
+	}
+}
+
 handler! {
 	async fn message(context: Context, msg: Message) {
 		if msg.author.id == get_data(&context).await.read().await.user_id { return }
-		if msg.content.len() > 0 && msg.content.as_bytes()[0] == b'$' {
-			match match lisp::tokenize(&msg.content[1..]) {
-				Ok(tokens) => match lisp::parse_all(&tokens) {
-					Ok(parse) => {
-						let lock = get_data(&context).await;
-						let env = &mut lock.write().await.env;
-						Some(parse
-							.iter()
-							.map(|i| {
-								match lisp::eval(i, env) {
-									Ok(v) => format!("{}", v),
-									Err(v) => format!("<Error: {}>", v),
-								}
-							}).collect::<Vec<_>>().join(" "))
-					},
-					Err(err) => Some(format!("Error during parsing: \n{}", err)),
-				},
-				Err(err) => Some(format!("Error during tokenizing: \n{}", err))
-			} {
-				Some(v) => {
-					if let Err(err) = msg.reply_ping(&context.http, v).await {
-						error!("message error: {}", err);
-					}
-				},
-				None => {},
+		if msg.content.len() > 11 {
+			let mut start_offset = 0;
+			let mut values = vec![];
+			// check for embedded ```asyl\n…```’s
+			while let Some(start_idx) = msg.content[start_offset..].find("```asyl\n") {
+				let off = start_offset + start_idx + 8;
+				if let Some(end_idx) = msg.content[off..].find("```") {
+					values.push(msg.content[off..off + end_idx].trim());
+					start_offset = off + end_idx + 3;
+				} else {
+					break
+				}
+			}
+			if values.len() > 0 {
+				eval_print(&context, &msg, &values.join("\n")).await;
 			}
 		}
 	}
 	async fn ready(context: Context, ready: Ready) {
-		info!("logged in as {}", ready.user.name);
+		log::info!("logged in as {}", ready.user.name);
 		{
 			let lock = get_data(&context).await;
 			let mut global_data = lock.write().await;
@@ -127,6 +153,6 @@ async fn main() {
 		data.insert::<GlobalData>(Arc::new(RwLock::new(GlobalData::new())))
 	}
 	if let Err(err) = client.start().await {
-		error!("client: {:?}", err);
+		log::error!("client: {:?}", err);
 	}
 }
