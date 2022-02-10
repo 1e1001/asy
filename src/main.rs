@@ -1,11 +1,12 @@
 #![feature(trace_macros)]
 #![feature(box_syntax)]
-use std::fs;
+use std::{fs, fmt};
 use std::sync::Arc;
 use std::process::Command;
 
 use serenity::Client;
 use serenity::client::{EventHandler, Context};
+use serenity::http::CacheHttp;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::TypeMapKey;
@@ -78,10 +79,13 @@ async fn get_data(ctx: &Context) -> Arc<RwLock<GlobalData>> {
 	data.get::<GlobalData>().unwrap().clone()
 }
 
-fn handle_err<T, E: std::error::Error>(f: Result<T, E>) {
+fn handle_err<T, E: std::error::Error>(f: Result<T, E>) -> Option<T> {
 	match f {
-		Ok(_) => {},
-		Err(e) => log::error!("internal error: {}", e),
+		Ok(v) => Some(v),
+		Err(e) => {
+			log::error!("internal error: {}", e);
+			None
+		},
 	}
 }
 
@@ -117,8 +121,18 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 		},
 		Err(err) => Some(format!("Error during tokenizing:\n{}{}", err, err.print()))
 	} {
-		Some(v) => handle_err(msg.reply_ping(&context.http, v).await),
+		Some(v) => { handle_err(msg.reply_ping(&context.http, v).await); },
 		None => {},
+	}
+}
+
+async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Message, c: impl fmt::Display) -> serenity::Result<()> {
+	match edit {
+		Some(mut v) => v.edit(cache, |m| m.content(c)).await,
+		None => {
+			reply.reply_ping(cache, c).await?;
+			Ok(())
+		},
 	}
 }
 
@@ -136,26 +150,29 @@ handler! {
 			} else if msg.content == "$asyl:intern" {
 				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.map)).await);
 			} else if msg.content == "$asyl:pull" {
+				let edit = handle_err(msg.reply_ping(&context.http, "`git pull`...").await);
 				match Command::new("/usr/bin/git").arg("pull").output() {
 					Ok(out) => {
-						handle_err(msg.reply_ping(&context.http,
-							format!("`git pull`:\nstdout:```\n{}```stderr:```\n{}```",
+						handle_err(edit_or_reply(&context.http, edit, &msg,
+							format!("`git pull`:\n```\nstdout:\n{}``````\nstderr:\n{}\n```",
 								String::from_utf8_lossy(&out.stdout),
 								String::from_utf8_lossy(&out.stderr))).await);
 					},
-					Err(e) => handle_err(msg.reply_ping(&context.http, format!("`git pull`:\nerror: {}", e)).await),
+					Err(e) => { handle_err(edit_or_reply(&context.http, edit, &msg, format!("`git pull`:\nerror: {}", e)).await); },
 				}
 			} else if msg.content == "$asyl:build" {
+				let edit = handle_err(msg.reply_ping(&context.http, "`cargo build`...").await);
 				match Command::new("/usr/bin/cargo").arg("build").output() {
 					Ok(out) => {
-						handle_err(msg.reply_ping(&context.http,
-							format!("`cargo build`:\nstdout:```\n{}```stderr:```\n{}```",
+						handle_err(edit_or_reply(&context.http, edit, &msg,
+							format!("`cargo build`:```\nstdout:\n{}``````\nstderr:\n{}\n```",
 								String::from_utf8_lossy(&out.stdout),
 								String::from_utf8_lossy(&out.stderr))).await);
 					},
-					Err(e) => handle_err(msg.reply_ping(&context.http, format!("`cargo build`:\nerror: {}", e)).await),
+					Err(e) => { handle_err(edit_or_reply(&context.http, edit, &msg, format!("`cargo build`:\nerror: {}", e)).await); },
 				}
 			} else if msg.content == "$asyl:reboot" {
+				handle_err(msg.reply_ping(&context.http, "cya!").await);
 				std::process::exit(0);
 			}
 		}
