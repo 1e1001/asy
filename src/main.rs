@@ -1,18 +1,22 @@
 #![feature(trace_macros)]
+#![feature(box_syntax)]
 use std::fs;
 use std::sync::Arc;
+use std::process::Command;
 
 use serenity::Client;
 use serenity::client::{EventHandler, Context};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::TypeMapKey;
+use strmap::{StrMap, MappedStr};
 use tokio::sync::RwLock;
 
 mod lisp;
 mod utils;
+mod strmap;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct EnvData {
 	token: String,
 	owner: u64,
@@ -31,14 +35,19 @@ struct EnvData {
 
 pub struct GlobalData {
 	user_id: u64,
-	env: lisp::AsylEnv,
+	owner_id: u64,
+	env: Arc<std::sync::RwLock<lisp::AsylEnv>>,
+	map: StrMap,
 }
 
 impl GlobalData {
-	fn new() -> Self {
+	fn new(env: EnvData) -> Self {
+		let mut map = StrMap::new();
 		Self {
 			user_id: 0,
-			env: lisp::default_env(),
+			owner_id: env.owner,
+			env: Arc::new(std::sync::RwLock::new(lisp::default_env(&mut map))),
+			map
 		}
 	}
 }
@@ -69,48 +78,87 @@ async fn get_data(ctx: &Context) -> Arc<RwLock<GlobalData>> {
 	data.get::<GlobalData>().unwrap().clone()
 }
 
+fn handle_err<T, E: std::error::Error>(f: Result<T, E>) {
+	match f {
+		Ok(_) => {},
+		Err(e) => log::error!("internal error: {}", e),
+	}
+}
+
 async fn eval_print(context: &Context, msg: &Message, text: &str) {
-	match match lisp::tokenize(text) {
+	let lock = get_data(&context).await;
+	let mut data = lock.write().await;
+	let name_mapped = MappedStr::new(&msg.author.name, &mut data.map);
+	let text_mapped = MappedStr::new(text, &mut data.map);
+	match match lisp::tokenize(&mut data.map, name_mapped, text_mapped) {
 		Ok(tokens) => match lisp::parse_all(&tokens) {
 			Ok(parse) => {
-				let lock = get_data(&context).await;
-				let env = &mut lock.write().await.env;
 				// todo: get some sort of user env here?
 				// we need nested envs before that though
 				let mut errors = vec![];
 				let mut res = parse
 					.iter()
 					.map(|i| {
-						match lisp::eval(i, env) {
-							Ok(v) => v.0.to_string(),
+						match lisp::eval(i, &data.env.clone(), &mut data.map) {
+							Ok(v) => v.to_string(),
 							Err(v) => { errors.push(v); "<error>".to_string() },
 						}
 					})
-					.collect::<Vec<_>>().join(" ");
+					.collect::<Vec<_>>().join("\n");
 				if errors.len() > 0 {
 					res.push_str("\nerrors:\n");
 					for i in errors {
-						res.push_str(&format!("{}{}", i, i.print_span(&msg.author.name, text)));
+						res.push_str(&format!("{}{}", i, i.print()));
 					}
 				}
 				Some(res)
 			},
-			Err(err) => Some(format!("Error during parsing:\n{}{}", err, err.print_span(&msg.author.name, text))),
+			Err(err) => Some(format!("Error during parsing:\n{}{}", err, err.print())),
 		},
-		Err(err) => Some(format!("Error during tokenizing:\n{}{}", err, err.print_span(&msg.author.name, text)))
+		Err(err) => Some(format!("Error during tokenizing:\n{}{}", err, err.print()))
 	} {
-		Some(v) => {
-			if let Err(err) = msg.reply_ping(&context.http, v).await {
-				log::error!("message error: {}", err);
-			}
-		},
+		Some(v) => handle_err(msg.reply_ping(&context.http, v).await),
 		None => {},
 	}
 }
 
 handler! {
 	async fn message(context: Context, msg: Message) {
-		if msg.author.id == get_data(&context).await.read().await.user_id { return }
+		let (bot_id, owner_id) = {
+			let read = get_data(&context).await;
+			let lock = read.read().await;
+			(lock.user_id, lock.owner_id)
+		};
+		if msg.author.id == bot_id { return }
+		if msg.author.id == owner_id {
+			if msg.content == "$asyl:env" {
+				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.env)).await);
+			} else if msg.content == "$asyl:intern" {
+				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.map)).await);
+			} else if msg.content == "$asyl:pull" {
+				match Command::new("/usr/bin/git").arg("pull").output() {
+					Ok(out) => {
+						handle_err(msg.reply_ping(&context.http,
+							format!("`git pull`:\nstdout:```\n{}```stderr:```\n{}```",
+								String::from_utf8_lossy(&out.stdout),
+								String::from_utf8_lossy(&out.stderr))).await);
+					},
+					Err(e) => handle_err(msg.reply_ping(&context.http, format!("`git pull`:\nerror: {}", e)).await),
+				}
+			} else if msg.content == "$asyl:build" {
+				match Command::new("/usr/bin/cargo").arg("build").output() {
+					Ok(out) => {
+						handle_err(msg.reply_ping(&context.http,
+							format!("`cargo build`:\nstdout:```\n{}```stderr:```\n{}```",
+								String::from_utf8_lossy(&out.stdout),
+								String::from_utf8_lossy(&out.stderr))).await);
+					},
+					Err(e) => handle_err(msg.reply_ping(&context.http, format!("`cargo build`:\nerror: {}", e)).await),
+				}
+			} else if msg.content == "$asyl:reboot" {
+				std::process::exit(0);
+			}
+		}
 		if msg.content.len() > 11 {
 			let mut start_offset = 0;
 			let mut values = vec![];
@@ -153,7 +201,7 @@ async fn main() {
 		.expect("client fail");
 	{
 		let mut data = client.data.write().await;
-		data.insert::<GlobalData>(Arc::new(RwLock::new(GlobalData::new())))
+		data.insert::<GlobalData>(Arc::new(RwLock::new(GlobalData::new(env_data))))
 	}
 	if let Err(err) = client.start().await {
 		log::error!("client: {:?}", err);
