@@ -2,15 +2,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct MappedStr(Arc<String>);
 
 impl MappedStr {
-	pub fn new<T: Into<String>>(data: T, map: &mut StrMap) -> Self {
-		map.intern(data)
-	}
 	pub fn get_ref(&self) -> &str {
 		&self.0
 	}
@@ -27,7 +24,7 @@ impl ToString for MappedStr {
 }
 
 pub struct StrMap {
-	data: HashMap<String, MappedStr>,
+	data: HashMap<String, Weak<String>>,
 }
 
 impl fmt::Debug for StrMap {
@@ -47,8 +44,40 @@ impl StrMap {
 			data: HashMap::new(),
 		}
 	}
-	pub fn intern<T: Into<String>>(&mut self, v: T) -> MappedStr {
+	pub fn add<T: Into<String>>(&mut self, v: T) -> MappedStr {
 		let v = v.into();
-		self.data.entry(v.clone()).or_insert(MappedStr(Arc::new(v))).clone()
+		match match self.data.get(&v) {
+			Some(r) => match r.upgrade() {
+				Some(r) => Some(r),
+				None => None,
+			},
+			None => None,
+		} {
+			Some(r) => MappedStr(r),
+			None => {
+				let res = Arc::new(v.clone());
+				self.data.insert(v, Arc::downgrade(&res));
+				MappedStr(res)
+			},
+		}
+		// self.data.entry(v.clone()).or_insert(MappedStr(Arc::new(v))).clone()
+	}
+	pub fn gc(&mut self) {
+		let keys: Vec<_> = self.data.keys().map(|i| i.clone()).collect();
+		let mut saved = 0;
+		for k in keys {
+			let exists = {
+				// block here so the upgraded Arc gets dropped
+				match self.data[&k].upgrade() {
+					Some(_) => true,
+					None => false,
+    		}
+			};
+			if !exists {
+				saved += 1;
+				self.data.remove(&k);
+			}
+		}
+		log::debug!("StrMap gc() removed {} string(s)", saved);
 	}
 }

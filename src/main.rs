@@ -10,7 +10,7 @@ use serenity::http::CacheHttp;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::TypeMapKey;
-use strmap::{StrMap, MappedStr};
+use strmap::StrMap;
 use tokio::sync::RwLock;
 
 mod lisp;
@@ -92,8 +92,8 @@ fn handle_err<T, E: std::error::Error>(f: Result<T, E>) -> Option<T> {
 async fn eval_print(context: &Context, msg: &Message, text: &str) {
 	let lock = get_data(&context).await;
 	let mut data = lock.write().await;
-	let name_mapped = MappedStr::new(&msg.author.name, &mut data.map);
-	let text_mapped = MappedStr::new(text, &mut data.map);
+	let name_mapped = data.map.add(&msg.author.name);
+	let text_mapped = data.map.add(text);
 	match match lisp::tokenize(&mut data.map, name_mapped, text_mapped) {
 		Ok(tokens) => match lisp::parse_all(&tokens) {
 			Ok(parse) => {
@@ -117,13 +117,14 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 				}
 				Some(res)
 			},
-			Err(err) => Some(format!("Error during parsing:\n{}{}", err, err.print())),
+			Err(err) => Some(format!("Parsing error:\n{}{}", err, err.print())),
 		},
-		Err(err) => Some(format!("Error during tokenizing:\n{}{}", err, err.print()))
+		Err(err) => Some(format!("Tokenizing error:\n{}{}", err, err.print()))
 	} {
 		Some(v) => { handle_err(msg.reply_ping(&context.http, v).await); },
 		None => {},
 	}
+	data.map.gc();
 }
 
 async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Message, c: impl fmt::Display) -> serenity::Result<()> {
@@ -133,6 +134,28 @@ async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Mes
 			reply.reply_ping(cache, c).await?;
 			Ok(())
 		},
+	}
+}
+
+async fn run_command(context: &Context, msg: &Message, cmd: &[&str]) {
+	let edit = handle_err(msg.reply_ping(&context.http, format!("`{}`...", cmd.join(" "))).await);
+	let mut command = Command::new(cmd[0]);
+	for i in &cmd[1..] {
+		command.arg(i);
+	}
+	match command.output() {
+		Ok(out) => {
+			let content = format!("### stdout ###\n{}\n### stderr ###\n{}\n",
+				String::from_utf8_lossy(&out.stdout),
+				String::from_utf8_lossy(&out.stderr));
+			handle_err(msg.channel_id.send_message(&context.http, |m| {
+				m.content("done");
+				m.reference_message(msg);
+				m.add_file((content.as_bytes(), "logs.txt"));
+				m
+			}).await);
+		},
+		Err(e) => { handle_err(edit_or_reply(&context.http, edit, &msg, format!("`git pull`:\nerror: {}", e)).await); },
 	}
 }
 
@@ -150,27 +173,9 @@ handler! {
 			} else if msg.content == "$asyl:intern" {
 				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.map)).await);
 			} else if msg.content == "$asyl:pull" {
-				let edit = handle_err(msg.reply_ping(&context.http, "`git pull`...").await);
-				match Command::new("/usr/bin/git").arg("pull").output() {
-					Ok(out) => {
-						handle_err(edit_or_reply(&context.http, edit, &msg,
-							format!("`git pull`:\n```\nstdout:\n{}``````\nstderr:\n{}\n```",
-								String::from_utf8_lossy(&out.stdout),
-								String::from_utf8_lossy(&out.stderr))).await);
-					},
-					Err(e) => { handle_err(edit_or_reply(&context.http, edit, &msg, format!("`git pull`:\nerror: {}", e)).await); },
-				}
+				run_command(&context, &msg, &["/usr/bin/git", "pull"]).await;
 			} else if msg.content == "$asyl:build" {
-				let edit = handle_err(msg.reply_ping(&context.http, "`cargo build`...").await);
-				match Command::new("/usr/bin/cargo").arg("build").output() {
-					Ok(out) => {
-						handle_err(edit_or_reply(&context.http, edit, &msg,
-							format!("`cargo build`:```\nstdout:\n{}``````\nstderr:\n{}\n```",
-								String::from_utf8_lossy(&out.stdout),
-								String::from_utf8_lossy(&out.stderr))).await);
-					},
-					Err(e) => { handle_err(edit_or_reply(&context.http, edit, &msg, format!("`cargo build`:\nerror: {}", e)).await); },
-				}
+				run_command(&context, &msg, &["/usr/bin/cargo", "build"]).await;
 			} else if msg.content == "$asyl:reboot" {
 				handle_err(msg.reply_ping(&context.http, "cya!").await);
 				std::process::exit(0);
