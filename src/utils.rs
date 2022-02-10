@@ -56,7 +56,7 @@ pub fn format_arg_range(r: Dual) -> String {
 }
 
 /// print a list of values
-pub fn format_list(items: &[&str], and: bool) -> String {
+pub fn format_list(items: &[String], and: bool) -> String {
 	if items.len() == 0 {
 		"nothing".to_string()
 	} else if items.len() == 1 {

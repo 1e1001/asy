@@ -182,7 +182,7 @@ impl fmt::Display for AsylError {
 			AsylErrorType::NotDefined(text) => format!("\\`{}\\` isn't defined", safe_string(text)),
 			AsylErrorType::UseDuringEval(text) => format!("Can't get the value of \\`{}\\` because it is currently being evaluated", safe_string(text)),
 			AsylErrorType::UnexpectedCloseParen => "Unexpected `)`".to_string(),
-			AsylErrorType::TypeMismatch(types) => format!("Type mismatch, expected {}", format_list(&types.iter().map(|v| v.to_string().as_str()).collect::<Vec<_>>(), false)),
+			AsylErrorType::TypeMismatch(types) => format!("Type mismatch, expected {}", format_list(&types.iter().map(|v| v.to_string()).collect::<Vec<_>>(), false)),
 			AsylErrorType::ArgMismatch(dual, got) => format!("Argument count mismatch: expected {} arguments, got {}", format_arg_range(*dual), got),
 			AsylErrorType::InvalidCall => "Invalid call".to_string(),
 			AsylErrorType::Internal => "Internal error".to_string(),
@@ -898,7 +898,7 @@ fn lookup_var(span: AsylSpan, name: &MappedStr, env: &Arc<RwLock<AsylEnv>>, map:
 // this feels like the kind of thing that'd just desugar into like (lambda-exec lambda . args)
 fn lambda_env(span: AsylSpan, args: &[MappedStr], parent: &Arc<RwLock<AsylEnv>>, arg_vals: &[AsylExpr]) -> AsylResult<AsylEnv> {
 	if arg_vals.len() != args.len() {
-		return Err(AsylError(AsylErrorType::ArgMismatch((args.len(), args.len()), arg_vals.len()), span))
+		return Err(AsylError(AsylErrorType::ArgMismatch((Some(args.len()), Some(args.len())), arg_vals.len()), span))
 	}
 	let mut data = HashMap::new();
 	for (k, v) in args.iter().zip(arg_vals.iter()) {
