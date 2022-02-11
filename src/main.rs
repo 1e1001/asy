@@ -4,6 +4,7 @@ use std::{fs, fmt};
 use std::sync::Arc;
 use std::process::Command;
 
+use asyl_old::{AsylEnv, default_scope};
 use serenity::Client;
 use serenity::client::{EventHandler, Context};
 use serenity::http::CacheHttp;
@@ -13,7 +14,8 @@ use serenity::prelude::TypeMapKey;
 use strmap::StrMap;
 use tokio::sync::RwLock;
 
-mod lisp;
+mod asyl;
+mod asyl_old;
 mod utils;
 mod strmap;
 
@@ -37,18 +39,21 @@ struct EnvData {
 pub struct GlobalData {
 	user_id: u64,
 	owner_id: u64,
-	env: Arc<std::sync::RwLock<lisp::AsylEnv>>,
-	map: StrMap,
+	scope: Arc<std::sync::RwLock<dyn asyl_old::AsylScope>>,
+	env: AsylEnv,
 }
 
 impl GlobalData {
-	fn new(env: EnvData) -> Self {
-		let mut map = StrMap::new();
+	fn new(env_vars: EnvData) -> Self {
+		let mut env = AsylEnv {
+			time: 1,
+			map: StrMap::new(),
+		};
 		Self {
 			user_id: 0,
-			owner_id: env.owner,
-			env: Arc::new(std::sync::RwLock::new(lisp::default_env(&mut map))),
-			map
+			owner_id: env_vars.owner,
+			scope: default_scope(&mut env),
+			env
 		}
 	}
 }
@@ -92,10 +97,10 @@ fn handle_err<T, E: std::error::Error>(f: Result<T, E>) -> Option<T> {
 async fn eval_print(context: &Context, msg: &Message, text: &str) {
 	let lock = get_data(&context).await;
 	let mut data = lock.write().await;
-	let name_mapped = data.map.add(&msg.author.name);
-	let text_mapped = data.map.add(text);
-	match match lisp::tokenize(&mut data.map, name_mapped, text_mapped) {
-		Ok(tokens) => match lisp::parse_all(&tokens) {
+	let name_mapped = data.env.map.add(&msg.author.name);
+	let text_mapped = data.env.map.add(text);
+	match match asyl_old::tokenize(&mut data.env, name_mapped, text_mapped) {
+		Ok(tokens) => match asyl_old::parse_all(&tokens, &mut data.env) {
 			Ok(parse) => {
 				// todo: get some sort of user env here?
 				// we need nested envs before that though
@@ -103,7 +108,8 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 				let mut res = parse
 					.iter()
 					.map(|i| {
-						match lisp::eval(i, &data.env.clone(), &mut data.map) {
+						let time = data.env.time;
+						match asyl_old::eval(i, &data.scope.clone(), &mut data.env, time) {
 							Ok(v) => v.to_string(),
 							Err(v) => { errors.push(v); "<error>".to_string() },
 						}
@@ -112,7 +118,7 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 				if errors.len() > 0 {
 					res.push_str("\nerrors:\n");
 					for i in errors {
-						res.push_str(&format!("{}{}", i, i.print()));
+						res.push_str(&i.print());
 					}
 				}
 				Some(res)
@@ -124,7 +130,7 @@ async fn eval_print(context: &Context, msg: &Message, text: &str) {
 		Some(v) => { handle_err(msg.reply_ping(&context.http, v).await); },
 		None => {},
 	}
-	data.map.gc();
+	data.env.map.gc();
 }
 
 async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Message, c: impl fmt::Display) -> serenity::Result<()> {
@@ -168,15 +174,15 @@ handler! {
 		};
 		if msg.author.id == bot_id { return }
 		if msg.author.id == owner_id {
-			if msg.content == "$asyl:env" {
-				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.env)).await);
-			} else if msg.content == "$asyl:intern" {
-				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.map)).await);
-			} else if msg.content == "$asyl:pull" {
+			if msg.content == "$asy:env" {
+				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.scope)).await);
+			} else if msg.content == "$asy:intern" {
+				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.env.map)).await);
+			} else if msg.content == "$asy:pull" {
 				run_command(&context, &msg, &["/usr/bin/git", "pull"]).await;
-			} else if msg.content == "$asyl:build" {
+			} else if msg.content == "$asy:build" {
 				run_command(&context, &msg, &["/usr/bin/cargo", "build"]).await;
-			} else if msg.content == "$asyl:reboot" {
+			} else if msg.content == "$asy:reboot" {
 				handle_err(msg.reply_ping(&context.http, "cya!").await);
 				std::process::exit(0);
 			}

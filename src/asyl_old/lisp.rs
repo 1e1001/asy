@@ -5,17 +5,17 @@
 //! there are a few notable differences though, the main ones
 //! being that it's styled like racket and (hopefully) lazily evaluates
 
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 use std::{error, fmt, iter};
 
 use crate::strmap::{MappedStr, StrMap};
-use crate::utils::{safe_string, range_to_dual, format_arg_range, format_list, Dual};
+use crate::utils::{range_to_dual, format_arg_range, format_list, Dual};
 
 #[derive(Debug, Clone)]
 pub enum AsylType {
-	Symbol, String, Float, Int, Bool, Type, List, Fn
+	Symbol, String, Float, Int, Bool, Type, List, Fn, Null
 }
 impl fmt::Display for AsylType {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -28,15 +28,16 @@ impl fmt::Display for AsylType {
 			AsylType::Type   => "'type",
 			AsylType::List   => "'list",
 			AsylType::Fn     => "'fn",
+			AsylType::Null   => "'null",
 		})
 	}
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AsylLambda {
 	args: Vec<MappedStr>,
 	body: AsylExpr,
-	env: Arc<RwLock<AsylEnv>>,
+	scope: Arc<RwLock<dyn AsylScope>>,
 }
 #[derive(Clone)]
 pub enum AsylExprValue {
@@ -55,8 +56,26 @@ pub enum AsylExprValue {
 	// - VList
 	//   - probably a slightly better implementation of that snap hybrid list
 	List(Vec<AsylExpr>),
-	ExtFn(fn(AsylSpan, &Arc<RwLock<AsylEnv>>, &[AsylExpr], &mut StrMap) -> Result<AsylExpr, AsylError>),
+	ExtFn(fn(AsylSpan, &Arc<RwLock<dyn AsylScope>>, &[AsylExpr], &mut AsylEnv, usize) -> Result<AsylExpr, AsylError>),
 	Lambda(Box<AsylLambda>),
+	Null,
+}
+
+impl fmt::Debug for AsylExprValue {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Symbol(a) => f.debug_tuple("Symbol").field(a).finish(),
+			Self::String(a) => f.debug_tuple("String").field(a).finish(),
+			Self::Float(a) => f.debug_tuple("Float").field(a).finish(),
+			Self::Int(a) => f.debug_tuple("Int").field(a).finish(),
+			Self::Bool(a) => f.debug_tuple("Bool").field(a).finish(),
+			Self::Type(a) => f.debug_tuple("Type").field(a).finish(),
+			Self::List(a) => f.debug_tuple("List").field(a).finish(),
+			Self::ExtFn(_) => f.debug_tuple("ExtFn").finish(),
+			Self::Lambda(a) => f.debug_tuple("Lambda").field(a).finish(),
+			Self::Null => write!(f, "Null"),
+		}
+	}
 }
 
 impl AsylExprValue {
@@ -71,6 +90,7 @@ impl AsylExprValue {
 			AsylExprValue::List(_)   => AsylType::List,
 			AsylExprValue::ExtFn(_)  => AsylType::Fn,
 			AsylExprValue::Lambda(_) => AsylType::Fn,
+    	AsylExprValue::Null      => AsylType::Null,
 		}
 	}
 }
@@ -84,7 +104,7 @@ pub struct AsylInSpan(AsylPos, usize);
 type AsylSpan = Option<AsylInSpan>;
 
 impl AsylInSpan {
-	pub fn print(&self) -> Result<String, fmt::Error> {
+	pub fn print(&self, span: &AsylError) -> Result<String, fmt::Error> {
 		let (source_name, source) = (&self.0.3, &self.0.4);
 		let mut out = String::new();
 		let mut cols_until_start = self.0.2 - 1;
@@ -118,7 +138,7 @@ impl AsylInSpan {
 				},
 			}
 		}
-		let mut prefixed = format!("```       ╭─[ {}:{} ]", source_name.get_ref(), self.0.1);
+		let mut prefixed = format!("```\n{}\n       ╭─[ {}:{} ]", span, source_name.get_ref(), self.0.1);
 		out.push_str("\n       │");
 		out.push_str("```");
 		prefixed.push_str(&out);
@@ -137,15 +157,16 @@ impl fmt::Display for AsylExpr {
 			AsylExprValue::Bool(v) => if *v {"'t"} else {"'f"}.to_string(),
 			AsylExprValue::List(v) => format!("({})", v.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")),
 			AsylExprValue::ExtFn(_) => "<proc>".to_string(),
-			AsylExprValue::Lambda(_) => "<proc>".to_string(),
+			AsylExprValue::Lambda(data) => format!("<lambda ({})>", data.args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")),
 			AsylExprValue::Type(v) => v.to_string(),
+    	AsylExprValue::Null => "null".to_string(),
 		})
 	}
 }
 
 impl fmt::Debug for AsylExpr {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_fmt(format_args!("{}", self))
+		f.debug_tuple("AsylExpr").field(&self.0).finish()
 	}
 }
 
@@ -154,14 +175,13 @@ impl fmt::Debug for AsylExpr {
 #[allow(dead_code)]
 pub enum AsylErrorType {
 	UnexpectedEOF,
+
 	// user data
 	InvalidEscape(String),
-	// user data
 	InvalidNumber(String),
-	// user data
 	NotDefined(String),
-	// user data
 	UseDuringEval(String),
+
 	UnexpectedCloseParen,
 	TypeMismatch(Vec<AsylType>),
 	ArgMismatch(Dual, usize),
@@ -177,13 +197,13 @@ impl fmt::Display for AsylError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&match &self.0 {
 			AsylErrorType::UnexpectedEOF => "Unexpected end of input".to_string(),
-			AsylErrorType::InvalidEscape(text) => format!("Invalid escape sequence \\`{}\\`", safe_string(text)),
-			AsylErrorType::InvalidNumber(text) => format!("Invalid number \\`{}\\`", safe_string(text)),
-			AsylErrorType::NotDefined(text) => format!("\\`{}\\` isn't defined", safe_string(text)),
-			AsylErrorType::UseDuringEval(text) => format!("Can't get the value of \\`{}\\` because it is currently being evaluated", safe_string(text)),
+			AsylErrorType::InvalidEscape(text) => format!("Invalid escape sequence \\`{}\\`", text),
+			AsylErrorType::InvalidNumber(text) => format!("Invalid number \\`{}\\`", text),
+			AsylErrorType::NotDefined(text) => format!("\\`{}\\` isn't defined", text),
+			AsylErrorType::UseDuringEval(text) => format!("Can't get the value of \\`{}\\` because it is currently being evaluated", text),
 			AsylErrorType::UnexpectedCloseParen => "Unexpected `)`".to_string(),
 			AsylErrorType::TypeMismatch(types) => format!("Type mismatch, expected {}", format_list(&types.iter().map(|v| v.to_string()).collect::<Vec<_>>(), false)),
-			AsylErrorType::ArgMismatch(dual, got) => format!("Argument count mismatch: expected {} arguments, got {}", format_arg_range(*dual), got),
+			AsylErrorType::ArgMismatch(dual, got) => format!("Argument count mismatch: expected {}, got {}", format_arg_range(*dual), got),
 			AsylErrorType::InvalidCall => "Invalid call".to_string(),
 			AsylErrorType::Internal => "Internal error".to_string(),
 			AsylErrorType::Shit => "Not implemented".to_string(),
@@ -194,7 +214,7 @@ impl fmt::Display for AsylError {
 impl AsylError {
 	pub fn print(&self) -> String {
 		match &self.1 {
-			Some(v) => v.print().unwrap_or("no trace :(".to_string()),
+			Some(v) => v.print(self).unwrap_or("no trace :(".to_string()),
 			None => "no trace :(".to_string()
 		}
 	}
@@ -204,7 +224,7 @@ impl error::Error for AsylError {}
 
 type AsylResult<T> = Result<T, AsylError>;
 #[derive(Debug, Clone)]
-pub enum AsylEnvEntry {
+pub enum AsylScopeEntry {
 	/// once you've just defined something
 	Unevaluated(AsylExpr),
 	/// while you're using it
@@ -212,10 +232,74 @@ pub enum AsylEnvEntry {
 	/// once you've used it
 	Evaluated(AsylExpr),
 }
-#[derive(Debug, Clone)]
+
+pub trait AsylScope: Sync + Send + fmt::Debug {
+	fn get_ring(&self, name: &MappedStr) -> Option<&BTreeMap<usize, AsylScopeEntry>>;
+	fn get_var(&self, name: &MappedStr, max_index: usize) -> Option<(&AsylScopeEntry, usize)> {
+		match self.get_ring(name) {
+			Some(ring) => {
+				if max_index == 0 {
+					match ring.iter().rev().next() {
+						Some(v) => Some((v.1, *v.0)),
+						None => None
+					}
+				} else {
+					let mut best_index = 0;
+					for k in ring.keys() {
+						if *k <= max_index {
+							best_index = *k;
+						}
+					}
+					if best_index > 0 {
+						Some((&ring[&best_index], best_index))
+					} else {
+						None
+					}
+				}
+			},
+			None => None
+		}
+	}
+	fn set_var(&mut self, name: MappedStr, index: usize, value: AsylScopeEntry);
+	fn get_parent(&self) -> Option<&Arc<RwLock<dyn AsylScope>>>;
+}
+#[derive(Debug)]
+struct AsylLambdaScope {
+	data: HashMap<MappedStr, BTreeMap<usize, AsylScopeEntry>>,
+	parent: Arc<RwLock<dyn AsylScope>>,
+}
+impl AsylScope for AsylLambdaScope {
+	fn get_ring(&self, name: &MappedStr) -> Option<&BTreeMap<usize, AsylScopeEntry>> {
+		self.data.get(name)
+	}
+	fn set_var(&mut self, name: MappedStr, index: usize, value: AsylScopeEntry) {
+		let ent = self.data.entry(name).or_insert_with(|| BTreeMap::new());
+		ent.insert(index, value);
+	}
+	fn get_parent(&self) -> Option<&Arc<RwLock<dyn AsylScope>>> {
+		Some(&self.parent)
+	}
+}
+#[derive(Debug)]
+pub struct AsylRootScope {
+	data: HashMap<MappedStr, BTreeMap<usize, AsylScopeEntry>>,
+}
+impl AsylScope for AsylRootScope {
+	fn get_ring(&self, name: &MappedStr) -> Option<&BTreeMap<usize, AsylScopeEntry>> {
+		self.data.get(name)
+	}
+	fn set_var(&mut self, name: MappedStr, index: usize, value: AsylScopeEntry) {
+		let ent = self.data.entry(name).or_insert_with(|| BTreeMap::new());
+		ent.insert(index, value);
+	}
+	fn get_parent(&self) -> Option<&Arc<RwLock<dyn AsylScope>>> {
+		None
+	}
+}
+
 pub struct AsylEnv {
-	data: HashMap<MappedStr, AsylEnvEntry>,
-	parent: Option<Arc<RwLock<AsylEnv>>>,
+	pub time: usize,
+	pub map: StrMap,
 }
 
 #[derive(Debug)]
@@ -276,8 +360,8 @@ macro_rules! tonicity_internal {
 // this is clever, so i'm stealing it :)
 macro_rules! ensure_tonicity {
 	($check_fn:expr) => {
-		|this, env, args, map| {
-			let args = eval_args(args, env, map)?;
+		|this, scope, args, env, time| {
+			let args = eval_args(args, scope, env, time)?;
 			assert_arg_length!(this, args, 1..);
 			tonicity_internal!(f64, f_f64, $check_fn);
 			tonicity_internal!(i64, f_i64, $check_fn);
@@ -313,33 +397,33 @@ macro_rules! assert_arg_length {
 	}
 }
 
-macro_rules! env_insert {
-	($map:expr, $env:expr, $name:expr, $value:expr) => {
-		$env.insert($map.add($name), AsylEnvEntry::Evaluated(AsylExpr($value, None, None)))
+macro_rules! scope_insert {
+	($env:expr, $scope:expr, $name:expr, $value:expr) => {
+		$scope.insert($env.map.add($name), BTreeMap::from([(1, AsylScopeEntry::Evaluated(AsylExpr($value, None, None)))]))
 	}
 }
 
-pub fn default_env(map: &mut StrMap) -> AsylEnv {
+pub fn default_scope(env: &mut AsylEnv) -> Arc<RwLock<dyn AsylScope>> {
 	let mut data = HashMap::new();
 	// maths
-	env_insert!(map, data, "+", AsylExprValue::ExtFn(|this, env, args, map| {
-		let args = eval_args(args, env, map)?;
+	scope_insert!(env, data, "+", AsylExprValue::ExtFn(|this, scope, args, env, time| {
+		let args = eval_args(args, scope, env, time)?;
 		assert_arg_length!(this, args, 1..);
 		Ok(AsylExpr(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExprValue::Float(v.iter().fold(0.0, |a, b| a + b)),
 			UniformNumberList::Int(v)   => AsylExprValue::Int(  v.iter().fold(0, |a, b| a + b)),
 		}, this, None))
 	}));
-	env_insert!(map, data, "*", AsylExprValue::ExtFn(|this, env, args, map| {
-		let args = eval_args(args, env, map)?;
+	scope_insert!(env, data, "*", AsylExprValue::ExtFn(|this, scope, args, env, time| {
+		let args = eval_args(args, scope, env, time)?;
 		assert_arg_length!(this, args, 1..);
 		Ok(AsylExpr(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExprValue::Float(v.iter().fold(1.0, |a, b| a * b)),
 			UniformNumberList::Int(v)   => AsylExprValue::Int(  v.iter().fold(1, |a, b| a * b)),
 		}, this, None))
 	}));
-	env_insert!(map, data, "-", AsylExprValue::ExtFn(|this, env, args, map| {
-		let args = eval_args(args, env, map)?;
+	scope_insert!(env, data, "-", AsylExprValue::ExtFn(|this, scope, args, env, time| {
+		let args = eval_args(args, scope, env, time)?;
 		assert_arg_length!(this, args, 2..);
 		Ok(AsylExpr(match to_uniform_number_list(&args)? {
 			UniformNumberList::Float(v) => AsylExprValue::Float(v[0] - v[1..].iter().fold(0.0, |a, b| a + b)),
@@ -347,46 +431,46 @@ pub fn default_env(map: &mut StrMap) -> AsylEnv {
 		}, this, None))
 	}));
 	// ' isn't quoting in this lang and # is used by discord
-	env_insert!(map, data, "'f", AsylExprValue::Bool(false));
-	env_insert!(map, data, "'t", AsylExprValue::Bool(true));
-	env_insert!(map, data, "'n", AsylExprValue::List(vec![]));
+	scope_insert!(env, data, "'f", AsylExprValue::Bool(false));
+	scope_insert!(env, data, "'t", AsylExprValue::Bool(true));
+	scope_insert!(env, data, "'n", AsylExprValue::List(vec![]));
 	// types
-	env_insert!(map, data, "'symbol", AsylExprValue::Type(AsylType::Symbol));
-	env_insert!(map, data, "'string", AsylExprValue::Type(AsylType::String));
-	env_insert!(map, data, "'float",  AsylExprValue::Type(AsylType::Float));
-	env_insert!(map, data, "'int",    AsylExprValue::Type(AsylType::Int));
-	env_insert!(map, data, "'bool",   AsylExprValue::Type(AsylType::Bool));
-	env_insert!(map, data, "'type",   AsylExprValue::Type(AsylType::Type));
-	env_insert!(map, data, "'list",   AsylExprValue::Type(AsylType::List));
-	env_insert!(map, data, "'fn",     AsylExprValue::Type(AsylType::Fn));
+	scope_insert!(env, data, "'symbol", AsylExprValue::Type(AsylType::Symbol));
+	scope_insert!(env, data, "'string", AsylExprValue::Type(AsylType::String));
+	scope_insert!(env, data, "'float",  AsylExprValue::Type(AsylType::Float));
+	scope_insert!(env, data, "'int",    AsylExprValue::Type(AsylType::Int));
+	scope_insert!(env, data, "'bool",   AsylExprValue::Type(AsylType::Bool));
+	scope_insert!(env, data, "'type",   AsylExprValue::Type(AsylType::Type));
+	scope_insert!(env, data, "'list",   AsylExprValue::Type(AsylType::List));
+	scope_insert!(env, data, "'fn",     AsylExprValue::Type(AsylType::Fn));
 	// comparisons
-	env_insert!(map, data, ">",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a > b)));
-	env_insert!(map, data, "=",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a == b)));
-	env_insert!(map, data, ">=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a >= b)));
-	env_insert!(map, data, "<",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a < b)));
-	env_insert!(map, data, "!=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a != b)));
-	env_insert!(map, data, "<=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a <= b)));
+	scope_insert!(env, data, ">",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a > b)));
+	scope_insert!(env, data, "=",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a == b)));
+	scope_insert!(env, data, ">=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a >= b)));
+	scope_insert!(env, data, "<",  AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a < b)));
+	scope_insert!(env, data, "!=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a != b)));
+	scope_insert!(env, data, "<=", AsylExprValue::ExtFn(ensure_tonicity!(|a, b| a <= b)));
 	// logical joiners
-	env_insert!(map, data, "&&", AsylExprValue::ExtFn(|this, env, args, map| {
+	scope_insert!(env, data, "&&", AsylExprValue::ExtFn(|this, scope, args, env, time| {
 		for arg in args {
-			let res = eval(arg, env, map)?;
+			let res = eval(arg, scope, env, time)?;
 			if *assert_type!(this.clone(), res, Bool)? == false {
 				return Ok(AsylExpr(AsylExprValue::Bool(false), this, None))
 			}
 		}
 		Ok(AsylExpr(AsylExprValue::Bool(true), this, None))
 	}));
-	env_insert!(map, data, "||", AsylExprValue::ExtFn(|this, env, args, map| {
+	scope_insert!(env, data, "||", AsylExprValue::ExtFn(|this, scope, args, env, time| {
 		for arg in args {
-			let res = eval(arg, env, map)?;
+			let res = eval(arg, scope, env, time)?;
 			if *assert_type!(this.clone(), res, Bool)? == true {
 				return Ok(AsylExpr(AsylExprValue::Bool(true), this, None))
 			}
 		}
 		Ok(AsylExpr(AsylExprValue::Bool(false), this, None))
 	}));
-	env_insert!(map, data, "^^", AsylExprValue::ExtFn(|this, env, args, map| {
-		let args = eval_args(args, env, map)?;
+	scope_insert!(env, data, "^^", AsylExprValue::ExtFn(|this, scope, args, env, time| {
+		let args = eval_args(args, scope, env, time)?;
 		Ok(AsylExpr(AsylExprValue::Bool(
 			args
 			.iter()
@@ -396,46 +480,50 @@ pub fn default_env(map: &mut StrMap) -> AsylEnv {
 			.fold(false, |a, b| if **b {!a} else {a})
 		), this, None))
 	}));
-	env_insert!(map, data, "!", AsylExprValue::ExtFn(|this, env, args, map| {
-		let args = eval_args(args, env, map)?;
+	scope_insert!(env, data, "!", AsylExprValue::ExtFn(|this, scope, args, env, time| {
+		let args = eval_args(args, scope, env, time)?;
 		assert_arg_length!(this, args, 1..=1);
 		Ok(AsylExpr(AsylExprValue::Bool(!*assert_type!(this.clone(), args[0], Bool)?), this, None))
 	}));
 	// typeof operator
-	env_insert!(map, data, "'", AsylExprValue::ExtFn(|this, env, args, map| {
+	scope_insert!(env, data, "'", AsylExprValue::ExtFn(|this, scope, args, env, time| {
 		assert_arg_length!(this, args, 1..=1);
-		return Ok(AsylExpr(AsylExprValue::Type(eval(&args[0], env, map)?.0.get_type()), this, None))
+		return Ok(AsylExpr(AsylExprValue::Type(eval(&args[0], scope, env, time)?.0.get_type()), this, None))
 	}));
-	env_insert!(map, data, "if", AsylExprValue::ExtFn(|this, env, args, map| {
+	scope_insert!(env, data, "if", AsylExprValue::ExtFn(|this, scope, args, env, time| {
 		assert_arg_length!(this, args, 3..=3);
-		if *assert_type!(this, eval(&args[0], env, map)?, Bool)? {
-			eval(&args[1], env, map)
+		if *assert_type!(this, eval(&args[0], scope, env, time)?, Bool)? {
+			eval(&args[1], scope, env, time)
 		} else {
-			eval(&args[2], env, map)
+			eval(&args[2], scope, env, time)
 		}
 	}));
 	// i like def and fn over define and lambda, so i'm using those
-	env_insert!(map, data, "def", AsylExprValue::ExtFn(|this, env, args, map| {
+	scope_insert!(env, data, "def", AsylExprValue::ExtFn(|this, scope, args, env, time| {
 		assert_arg_length!(this, args, 2..=2);
 		if let Some(v) = check_type!(this.clone(), args[0], List) {
 			return eval(&AsylExpr(AsylExprValue::List(vec![
-				AsylExpr(AsylExprValue::Symbol(map.add("def")), None, None),
+				AsylExpr(AsylExprValue::Symbol(env.map.add("def")), None, None),
 				v[0].clone(),
 				AsylExpr(AsylExprValue::List(vec![
-					AsylExpr(AsylExprValue::Symbol(map.add("fn")), None, None),
+					AsylExpr(AsylExprValue::Symbol(env.map.add("fn")), None, None),
 					AsylExpr(AsylExprValue::List(v[1..].into()), None, None),
 					args[1].clone()
 				]), None, None)
-			]), None, None), env, map)
+			]), None, None), scope, env, time)
 		}
 		let name = assert_type!(this.clone(), args[0], Symbol)?;
 		{
-			let mut lock = env.write().map_err(|_| AsylError(AsylErrorType::Internal, this))?;
-			lock.data.insert(name.clone(), AsylEnvEntry::Unevaluated(args[1].clone()));
+			let mut lock = scope.write().map_err(|_| AsylError(AsylErrorType::Internal, this))?;
+			if lock.get_var(&name, 0).is_some() {
+				env.time += 1;
+				log::debug!("env.time + 1 (now {}) (def)", env.time);
+			}
+			lock.set_var(name.clone(), env.time, AsylScopeEntry::Unevaluated(args[1].clone()));
 		}
 		Ok(args[0].clone())
 	}));
-	env_insert!(map, data, "fn", AsylExprValue::ExtFn(|this, env, args, _map| {
+	scope_insert!(env, data, "fn", AsylExprValue::ExtFn(|this, scope, args, _env, _time| {
 		// todo: add a begin op and support more than 2 args here
 		// asal!(this, args, 2.., "at least two arguments");
 		assert_arg_length!(this, args, 2..=2);
@@ -447,10 +535,10 @@ pub fn default_env(map: &mut StrMap) -> AsylEnv {
 		Ok(AsylExpr(AsylExprValue::Lambda(box AsylLambda {
 			args: lambda_args,
 			body: args[1].clone(),
-			env: env.clone(),
+			scope: scope.clone(),
 		}), this, None))
 	}));
-	AsylEnv { data, parent: None }
+	Arc::new(RwLock::new(AsylRootScope { data }))
 }
 
 #[derive(Debug)]
@@ -463,7 +551,7 @@ pub enum AsylTokenValue {
 pub struct AsylToken(AsylTokenValue, AsylSpan);
 
 #[derive(Clone)]
-pub struct AsylExpr(pub AsylExprValue, pub AsylSpan, pub Option<Arc<RwLock<AsylEnv>>>);
+pub struct AsylExpr(pub AsylExprValue, pub AsylSpan, pub Option<Arc<RwLock<dyn AsylScope>>>);
 
 enum StartQuoteType {
 	Quote,
@@ -505,7 +593,7 @@ fn char_type(c: char) -> CharType {
 	}
 }
 
-pub fn tokenize(map: &mut StrMap, file_name: MappedStr, data: MappedStr) -> AsylResult<Vec<AsylToken>> {
+pub fn tokenize(env: &mut AsylEnv, file_name: MappedStr, data: MappedStr) -> AsylResult<Vec<AsylToken>> {
 	let mut line = 1;
 	let mut col = 1;
 	let mut iter = data.get_ref().chars().enumerate().map(|(i, v)| {
@@ -600,7 +688,7 @@ pub fn tokenize(map: &mut StrMap, file_name: MappedStr, data: MappedStr) -> Asyl
 						}
 					}
 				}
-				out.push(AsylToken(AsylTokenValue::String(map.add(res)), Some(AsylInSpan(chi, len))));
+				out.push(AsylToken(AsylTokenValue::String(env.map.add(res)), Some(AsylInSpan(chi, len))));
 			},
 			CharType::Other(ch) => {
 				// consume until it's not other
@@ -618,7 +706,7 @@ pub fn tokenize(map: &mut StrMap, file_name: MappedStr, data: MappedStr) -> Asyl
 					// we know this value so we discard it
 					iter.next();
 				}
-				out.push(AsylToken(AsylTokenValue::Symbol(map.add(res)), Some(AsylInSpan(chi, len))));
+				out.push(AsylToken(AsylTokenValue::Symbol(env.map.add(res)), Some(AsylInSpan(chi, len))));
 			},
 			CharType::Whitespace => {},
 		}
@@ -639,21 +727,21 @@ fn merge_span(start: AsylSpan, end: AsylSpan) -> AsylSpan {
 	}
 }
 
-pub fn parse_all(tokens: &[AsylToken]) -> AsylResult<Vec<AsylExpr>> {
+pub fn parse_all(tokens: &[AsylToken], env: &mut AsylEnv) -> AsylResult<Vec<AsylExpr>> {
 	let mut out = vec![];
 	let mut rest = tokens;
 	while rest.len() > 0 {
-		let (token, new_rest) = parse(rest)?;
+		let (token, new_rest) = parse(rest, env)?;
 		out.push(token);
 		rest = new_rest;
 	}
 	Ok(out)
 }
 
-fn parse<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
+fn parse<'a>(tokens: &'a [AsylToken], env: &mut AsylEnv) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
 	let (token, rest) = tokens.split_first().ok_or(AsylError(AsylErrorType::UnexpectedEOF, None))?;
 	match &token.0 {
-		AsylTokenValue::Paren(true) => read_seq(token.1.clone(), rest),
+		AsylTokenValue::Paren(true) => read_seq(token.1.clone(), rest, env),
 		AsylTokenValue::Paren(false) => {
 			Err(AsylError(AsylErrorType::UnexpectedCloseParen, token.1.clone()))
 		},
@@ -666,7 +754,7 @@ fn parse<'a>(tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])>
 	}
 }
 
-fn read_seq<'a>(start: AsylSpan, tokens: &'a [AsylToken]) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
+fn read_seq<'a>(start: AsylSpan, tokens: &'a [AsylToken], env: &mut AsylEnv) -> AsylResult<(AsylExpr, &'a [AsylToken])> {
 	let mut res = vec![];
 	let mut xs = tokens;
 	loop {
@@ -674,7 +762,7 @@ fn read_seq<'a>(start: AsylSpan, tokens: &'a [AsylToken]) -> AsylResult<(AsylExp
 		match token.0 {
 			AsylTokenValue::Paren(false) => return Ok((AsylExpr(AsylExprValue::List(res), merge_span(start, token.1.clone()), None), rest)),
 			_ => {
-				let (exp, new_xs) = parse(&xs)?;
+				let (exp, new_xs) = parse(&xs, env)?;
 				res.push(exp);
 				xs = new_xs;
 			}
@@ -774,7 +862,7 @@ fn parse_number(data: &str, span: AsylSpan) -> AsylResult<AsylExpr> {
 						return Err(asyl_error());
 					}
 					int *= base as u64;
-					int |= char_val(o, base).ok_or_else(asyl_error)? as u64;
+					int += char_val(o, base).ok_or_else(asyl_error)? as u64;
 					int_len += 1;
 				},
 			},
@@ -847,30 +935,30 @@ fn parse_number(data: &str, span: AsylSpan) -> AsylResult<AsylExpr> {
 	}
 }
 
-fn eval_args(args: &[AsylExpr], env: &Arc<RwLock<AsylEnv>>, map: &mut StrMap) -> AsylResult<Vec<AsylExpr>> {
-	args.iter().map(|x| eval(x, env, map)).collect()
+fn eval_args(args: &[AsylExpr], scope: &Arc<RwLock<dyn AsylScope>>, env: &mut AsylEnv, time: usize) -> AsylResult<Vec<AsylExpr>> {
+	args.iter().map(|x| eval(x, scope, env, time)).collect()
 }
 
-fn lookup_var(span: AsylSpan, name: &MappedStr, env: &Arc<RwLock<AsylEnv>>, map: &mut StrMap) -> AsylResult<AsylExpr> {
+fn lookup_var(span: AsylSpan, name: &MappedStr, time: usize, scope: &Arc<RwLock<dyn AsylScope>>, env: &mut AsylEnv) -> AsylResult<AsylExpr> {
 	enum LookupResult {
 		Ok(AsylExpr),
 		Err(AsylError),
-		Recurse(Arc<RwLock<AsylEnv>>),
-		Insert(AsylExpr),
+		Recurse(Arc<RwLock<dyn AsylScope>>),
+		Insert(AsylExpr, usize),
 	}
 	let res = {
-		let lock = env.read().map_err(|_| AsylError(AsylErrorType::Internal, span.clone()))?;
-		match lock.data.get(&name) {
-			Some(v) => match v {
-				AsylEnvEntry::Unevaluated(exp) => {
+		let lock = scope.read().map_err(|_| AsylError(AsylErrorType::Internal, span.clone()))?;
+		match lock.get_var(&name, time) {
+			Some(v) => match v.0 {
+				AsylScopeEntry::Unevaluated(exp) => {
 					// lock.data.insert(name.to_string(), AsylEnvEntry::Evaluated(exp_eval.clone()));
-					LookupResult::Insert(exp.clone())
+					LookupResult::Insert(exp.clone(), v.1)
 				},
-				AsylEnvEntry::Evaluated(exp) => LookupResult::Ok(exp.clone()),
-				AsylEnvEntry::Evaluating => LookupResult::Err(AsylError(AsylErrorType::UseDuringEval(name.to_string()), span.clone())),
+				AsylScopeEntry::Evaluated(exp) => LookupResult::Ok(exp.clone()),
+				AsylScopeEntry::Evaluating => LookupResult::Err(AsylError(AsylErrorType::UseDuringEval(name.to_string()), span.clone())),
 			},
-			None => match &lock.parent {
-				Some(parent) => LookupResult::Recurse(parent.clone()),
+			None => match &lock.get_parent() {
+				Some(parent) => LookupResult::Recurse((*parent).clone()),
 				None => LookupResult::Err(AsylError(AsylErrorType::NotDefined(name.to_string()), span.clone())),
 			}
 		}
@@ -878,17 +966,18 @@ fn lookup_var(span: AsylSpan, name: &MappedStr, env: &Arc<RwLock<AsylEnv>>, map:
 	match res {
 		LookupResult::Ok(v) => Ok(v),
 		LookupResult::Err(v) => Err(v),
-		LookupResult::Recurse(parent) => lookup_var(span, name, &parent, map),
-		LookupResult::Insert(exp) => {
+		LookupResult::Recurse(parent) => lookup_var(span, name, time, &parent, env),
+		LookupResult::Insert(exp, time) => {
 			{
-				let mut write_lock = env.write().map_err(|_| AsylError(AsylErrorType::Internal, span.clone()))?;
-				write_lock.data.insert(name.clone(), AsylEnvEntry::Evaluating);
+				let mut write_lock = scope.write().map_err(|_| AsylError(AsylErrorType::Internal, span.clone()))?;
+				write_lock.set_var(name.clone(), time, AsylScopeEntry::Evaluating);
 			}
 			// free the lock so that further lookups in eval work
-			let value = eval(&exp, env, map)?;
+			// time travel happens here :)
+			let value = eval(&exp, scope, env, time)?;
 			{
-				let mut write_lock = env.write().map_err(|_| AsylError(AsylErrorType::Internal, span))?;
-				write_lock.data.insert(name.clone(), AsylEnvEntry::Evaluated(value.clone()));
+				let mut write_lock = scope.write().map_err(|_| AsylError(AsylErrorType::Internal, span))?;
+				write_lock.set_var(name.clone(), time, AsylScopeEntry::Evaluated(value.clone()));
 			}
 			Ok(value)
 		}
@@ -896,49 +985,55 @@ fn lookup_var(span: AsylSpan, name: &MappedStr, env: &Arc<RwLock<AsylEnv>>, map:
 }
 
 // this feels like the kind of thing that'd just desugar into like (lambda-exec lambda . args)
-fn lambda_env(span: AsylSpan, args: &[MappedStr], parent: &Arc<RwLock<AsylEnv>>, arg_vals: &[AsylExpr]) -> AsylResult<AsylEnv> {
+fn lambda_scope(span: AsylSpan, args: &[MappedStr], parent: &Arc<RwLock<dyn AsylScope>>, arg_vals: &[AsylExpr], env: &mut AsylEnv) -> AsylResult<Arc<RwLock<dyn AsylScope>>> {
 	if arg_vals.len() != args.len() {
 		return Err(AsylError(AsylErrorType::ArgMismatch((Some(args.len()), Some(args.len())), arg_vals.len()), span))
 	}
+	env.time += 1;
+	log::debug!("env.time + 1 (now {}) (lambda)", env.time);
 	let mut data = HashMap::new();
 	for (k, v) in args.iter().zip(arg_vals.iter()) {
-		data.insert(k.clone(), AsylEnvEntry::Unevaluated(v.clone()));
+		data.insert(k.clone(), BTreeMap::from([(env.time, AsylScopeEntry::Unevaluated(v.clone()))]));
 	}
-	Ok(AsylEnv { data, parent: Some(parent.clone()) })
+	Ok(Arc::new(RwLock::new(AsylLambdaScope { data, parent: parent.clone() })))
 }
 
 // todo: tail recursion optimization
-pub fn eval(exp: &AsylExpr, env: &Arc<RwLock<AsylEnv>>, map: &mut StrMap) -> AsylResult<AsylExpr> {
-	let env = match &exp.2 {
+pub fn eval(exp: &AsylExpr, scope: &Arc<RwLock<dyn AsylScope>>, env: &mut AsylEnv, time: usize) -> AsylResult<AsylExpr> {
+	log::debug!("eval {} {:?}", time, exp);
+	let scope = match &exp.2 {
 		Some(v) => v,
-		None => env,
+		None => scope,
 	};
-	match &exp.0 {
-		AsylExprValue::Symbol(v) => lookup_var(exp.1.clone(), v, env, map),
+	let res = match &exp.0 {
+		AsylExprValue::Symbol(v) => lookup_var(exp.1.clone(), v, time, scope, env),
 		AsylExprValue::List(list) => {
 			let first = list.first().ok_or(AsylError(AsylErrorType::InvalidCall, exp.1.clone()))?;
 			let args = &list[1..];
-			let res = eval(first, env, map)?;
+			let res = eval(first, scope, env, time)?;
 			match res.0 {
 				AsylExprValue::ExtFn(f) => {
-					Ok(f(exp.1.clone(), env, args, map)?)
+					Ok(f(exp.1.clone(), scope, args, env, time)?)
 				},
 				AsylExprValue::Lambda(f) => {
-					let new_env = Arc::new(RwLock::new(
-						lambda_env(exp.1.clone(), &f.args, &f.env, &args
+					let new_scope = lambda_scope(
+						exp.1.clone(), &f.args, &f.scope,
+						&args
 							.iter()
-							.map(|AsylExpr(a, b, _)| AsylExpr(a.clone(), b.clone(), Some(env.clone())))
-							.collect::<Vec<_>>()
-						)?
-					));
-					eval(&f.body, &new_env, map)
+							.map(|AsylExpr(a, b, _)| AsylExpr(a.clone(), b.clone(), Some(scope.clone())))
+							.collect::<Vec<_>>(),
+						env,
+					)?;
+					eval(&f.body, &new_scope, env, time)
 				},
 				// shorthand for an identity / force function
 				// for instance (define var 12) returns var
 				// but ((define var 12)) returns 12
-				_ => eval(exp, env, map),
+				_ => Ok(res),
 			}
 		},
 		other => Ok(AsylExpr(other.clone(), exp.1.clone(), exp.2.as_ref().map(|v| v.clone())))
-	}
+	};
+	log::debug!("eval result: {:?}", res);
+	res
 }
