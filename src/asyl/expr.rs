@@ -4,6 +4,9 @@ use tokio::sync::RwLock;
 
 use crate::strmap::MappedStr;
 
+use super::error::{AsylResult, AsylSpan};
+use super::scope::{AsylScope, AsylEnv};
+
 
 #[derive(Debug, Clone)]
 pub enum AsylType {
@@ -27,9 +30,9 @@ impl fmt::Display for AsylType {
 /// lambda data
 #[derive(Debug, Clone)]
 pub struct AsylLambda {
-	args: Vec<MappedStr>,
-	body: AsylExpr,
-	scope: Arc<RwLock<dyn AsylScope>>,
+	pub args: Vec<MappedStr>,
+	pub body: AsylExpr,
+	pub scope: Arc<RwLock<dyn AsylScope>>,
 }
 /// a value inside an expression
 #[derive(Clone)]
