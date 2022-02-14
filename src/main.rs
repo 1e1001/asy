@@ -1,5 +1,6 @@
 #![feature(trace_macros)]
 #![feature(box_syntax)]
+#![feature(bigint_helper_methods)]
 use std::collections::HashMap;
 use std::{fs, fmt};
 use std::sync::Arc;
