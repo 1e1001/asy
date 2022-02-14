@@ -60,7 +60,6 @@ impl StrMap {
 				MappedStr(res)
 			},
 		}
-		// self.data.entry(v.clone()).or_insert(MappedStr(Arc::new(v))).clone()
 	}
 	pub fn gc(&mut self) {
 		let keys: Vec<_> = self.data.keys().map(|i| i.clone()).collect();

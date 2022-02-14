@@ -3,14 +3,11 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::asyl::error::{AsylError, AsylErrorType};
-use crate::asyl::expr::AsylExprValue;
-use crate::asyl::scope::{AsylScopeEntry, AsylLambdaScope};
 use crate::strmap::MappedStr;
 
-use super::error::{AsylResult, AsylSpan};
-use super::expr::AsylExpr;
-use super::scope::{AsylScope, AsylEnv};
+use super::error::{AsylError, AsylErrorType, AsylResult, AsylSpan};
+use super::expr::{AsylExpr, AsylExprValue};
+use super::scope::{AsylScope, AsylEnv, AsylScopeEntry, AsylLambdaScope};
 
 
 async fn eval_args(args: &[AsylExpr], scope: &Arc<RwLock<dyn AsylScope>>, env: &mut AsylEnv, time: usize) -> AsylResult<Vec<AsylExpr>> {

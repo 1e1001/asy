@@ -27,6 +27,7 @@ dependencies = [
  "hex",
  "log",
  "serde",
+ "serde_json",
  "serenity",
  "tokio",
  "toml",

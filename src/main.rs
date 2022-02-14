@@ -1,21 +1,28 @@
 #![feature(trace_macros)]
 #![feature(box_syntax)]
+use std::collections::HashMap;
 use std::{fs, fmt};
 use std::sync::Arc;
 use std::process::Command;
 
-use asyl_old::{AsylEnv, default_scope};
+use mod_load::Module;
 use serenity::Client;
+use serenity::client::bridge::gateway::event::ShardStageUpdateEvent;
 use serenity::client::{EventHandler, Context};
 use serenity::http::CacheHttp;
-use serenity::model::channel::Message;
-use serenity::model::gateway::Ready;
+use serenity::model::channel::{Message, GuildChannel, ChannelCategory, Channel, Reaction, StageInstance, PartialGuildChannel};
+use serenity::model::event::{ChannelPinsUpdateEvent, GuildMembersChunkEvent, InviteCreateEvent, InviteDeleteEvent, MessageUpdateEvent, PresenceUpdateEvent, ResumedEvent, TypingStartEvent, VoiceServerUpdateEvent, ThreadListSyncEvent, ThreadMembersUpdateEvent};
+use serenity::model::gateway::{Presence, Ready};
+use serenity::model::guild::{Guild, GuildUnavailable, Emoji, Member, Role, PartialGuild, ThreadMember};
+use serenity::model::id::{GuildId, EmojiId, RoleId, ChannelId, MessageId};
+use serenity::model::user::{User, CurrentUser};
+use serenity::model::voice::VoiceState;
 use serenity::prelude::TypeMapKey;
-use strmap::StrMap;
+use serde_json::Value;
 use tokio::sync::RwLock;
 
-mod asyl;
-mod asyl_old;
+mod modules;
+mod mod_load;
 mod utils;
 mod strmap;
 
@@ -39,21 +46,15 @@ struct EnvData {
 pub struct GlobalData {
 	user_id: u64,
 	owner_id: u64,
-	scope: Arc<std::sync::RwLock<dyn asyl_old::AsylScope>>,
-	env: AsylEnv,
+	modules: Vec<Arc<dyn Module>>,
 }
 
 impl GlobalData {
-	fn new(env_vars: EnvData) -> Self {
-		let mut env = AsylEnv {
-			time: 1,
-			map: StrMap::new(),
-		};
+	fn new(env: EnvData) -> Self {
 		Self {
 			user_id: 0,
-			owner_id: env_vars.owner,
-			scope: default_scope(&mut env),
-			env
+			owner_id: env.owner,
+			modules: modules::gen_modules(),
 		}
 	}
 }
@@ -63,17 +64,40 @@ impl TypeMapKey for GlobalData {
 
 pub struct Handler;
 
-// force rust-analyzer to autocomplete my async trait
+async fn trigger_modules(ctx: &Context) {
+	let modules = {
+		let lock = get_data(ctx).await;
+		let data = lock.read().await;
+		data.modules.clone()
+	};
+}
+
+macro_rules! trigger_modules {
+	($context:tt) => {trigger_modules(&$context)};
+}
+
+macro_rules! handler_code_impl {
+	($name:tt ($context:ident: $context_ty:ty, $($arg:ident: $val:ty),* $(,)?) auto) => {
+		pub async fn $name($context: $context_ty, $($arg: $val),*) {
+			trigger_modules!($context);
+		}
+	};
+	($name:tt ($($arg:ident: $val:ty),* $(,)?) $code:tt) => {
+		pub async fn $name($($arg: $val),*) $code
+	};
+}
+
+// force rust-analyzer to rust-analyze my async trait
 // probably the best macro i've ever made
 macro_rules! handler {
-	($(async fn $name:tt ($($arg:tt: $val:tt),*) $code:block)+) => {
+	($(async fn $name:tt ($($arg:ident: $val:ty),* $(,)?) $code:tt)+) => {
 		mod handler_impl {
 			use super::*;
-			$(pub async fn $name($($arg: $val),*) $code)+
+			$(handler_code_impl!{$name($($arg: $val),*) $code})+
 		} #[async_trait::async_trait]
 		impl EventHandler for Handler {
 			$(async fn $name(&self, $($arg: $val),*) {
-				handler_impl::$name($($arg),*).await
+				handler_impl::$name($($arg),*).await;
 			})+
 		}
 	};
@@ -93,46 +117,6 @@ fn handle_err<T, E: std::error::Error>(f: Result<T, E>) -> Option<T> {
 		},
 	}
 }
-
-async fn eval_print(context: &Context, msg: &Message, text: &str) {
-	let lock = get_data(&context).await;
-	let mut data = lock.write().await;
-	let name_mapped = data.env.map.add(&msg.author.name);
-	let text_mapped = data.env.map.add(text);
-	match match asyl_old::tokenize(&mut data.env, name_mapped, text_mapped) {
-		Ok(tokens) => match asyl_old::parse_all(&tokens, &mut data.env) {
-			Ok(parse) => {
-				// todo: get some sort of user env here?
-				// we need nested envs before that though
-				let mut errors = vec![];
-				let mut res = parse
-					.iter()
-					.map(|i| {
-						let time = data.env.time;
-						match asyl_old::eval(i, &data.scope.clone(), &mut data.env, time) {
-							Ok(v) => v.to_string(),
-							Err(v) => { errors.push(v); "<error>".to_string() },
-						}
-					})
-					.collect::<Vec<_>>().join("\n");
-				if errors.len() > 0 {
-					res.push_str("\nerrors:\n");
-					for i in errors {
-						res.push_str(&i.print());
-					}
-				}
-				Some(res)
-			},
-			Err(err) => Some(format!("Parsing error:\n{}{}", err, err.print())),
-		},
-		Err(err) => Some(format!("Tokenizing error:\n{}{}", err, err.print()))
-	} {
-		Some(v) => { handle_err(msg.reply_ping(&context.http, v).await); },
-		None => {},
-	}
-	data.env.map.gc();
-}
-
 async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Message, c: impl fmt::Display) -> serenity::Result<()> {
 	match edit {
 		Some(mut v) => v.edit(cache, |m| m.content(c)).await,
@@ -165,54 +149,147 @@ async fn run_command(context: &Context, msg: &Message, cmd: &[&str]) {
 	}
 }
 
-handler! {
-	async fn message(context: Context, msg: Message) {
+handler! { // hell :)
+	async fn cache_ready(_ctx: Context, _guilds: Vec<GuildId>) auto
+	async fn channel_create(_ctx: Context, _channel: &GuildChannel) auto
+	async fn category_create(_ctx: Context, _category: &ChannelCategory) auto
+	async fn category_delete(_ctx: Context, _category: &ChannelCategory) auto
+	async fn channel_delete(_ctx: Context, _channel: &GuildChannel) auto
+	async fn channel_pins_update(_ctx: Context, _pin: ChannelPinsUpdateEvent) auto
+	async fn channel_update(_ctx: Context, _old: Option<Channel>, _new: Channel) auto
+	async fn guild_ban_addition(_ctx: Context, _guild_id: GuildId, _banned_user: User) auto
+	async fn guild_ban_removal(_ctx: Context, _guild_id: GuildId, _unbanned_user: User) auto
+	async fn guild_create(_ctx: Context, _guild: Guild, _is_new: bool) auto
+	async fn guild_delete(
+		_ctx: Context,
+		_incomplete: GuildUnavailable,
+		_full: Option<Guild>,
+	) auto
+	async fn guild_emojis_update(
+		_ctx: Context,
+		_guild_id: GuildId,
+		_current_state: HashMap<EmojiId, Emoji>,
+	) auto
+	async fn guild_integrations_update(_ctx: Context, _guild_id: GuildId) auto
+	async fn guild_member_addition(_ctx: Context, _guild_id: GuildId, _new_member: Member) auto
+	async fn guild_member_removal(
+		_ctx: Context,
+		_guild_id: GuildId,
+		_user: User,
+		_member_data_if_available: Option<Member>,
+	) auto
+	async fn guild_member_update(
+		_ctx: Context,
+		_old_if_available: Option<Member>,
+		_new: Member,
+	) auto
+	async fn guild_members_chunk(_ctx: Context, _chunk: GuildMembersChunkEvent) auto
+	async fn guild_role_create(_ctx: Context, _guild_id: GuildId, _new: Role) auto
+	async fn guild_role_delete(
+		_ctx: Context,
+		_guild_id: GuildId,
+		_removed_role_id: RoleId,
+		_removed_role_data_if_available: Option<Role>,
+	) auto
+	async fn guild_role_update(
+		_ctx: Context,
+		_guild_id: GuildId,
+		_old_data_if_available: Option<Role>,
+		_new: Role,
+	) auto
+	async fn guild_unavailable(_ctx: Context, _guild_id: GuildId) auto
+	async fn guild_update(
+		_ctx: Context,
+		_old_data_if_available: Option<Guild>,
+		_new_but_incomplete: PartialGuild,
+	) auto
+	async fn invite_create(_ctx: Context, _data: InviteCreateEvent) auto
+	async fn invite_delete(_ctx: Context, _data: InviteDeleteEvent) auto
+	async fn message(ctx: Context, msg: Message) {
 		let (bot_id, owner_id) = {
-			let read = get_data(&context).await;
+			let read = get_data(&ctx).await;
 			let lock = read.read().await;
 			(lock.user_id, lock.owner_id)
 		};
 		if msg.author.id == bot_id { return }
+		// move this to core
 		if msg.author.id == owner_id {
-			if msg.content == "$asy:env" {
-				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.scope)).await);
-			} else if msg.content == "$asy:intern" {
-				handle_err(msg.reply_ping(&context.http, format!("{:?}", get_data(&context).await.read().await.env.map)).await);
-			} else if msg.content == "$asy:pull" {
-				run_command(&context, &msg, &["/usr/bin/git", "pull"]).await;
+			if msg.content == "$asy:pull" {
+				run_command(&ctx, &msg, &["/usr/bin/git", "pull"]).await;
 			} else if msg.content == "$asy:build" {
-				run_command(&context, &msg, &["/usr/bin/cargo", "build"]).await;
+				run_command(&ctx, &msg, &["/usr/bin/cargo", "build"]).await;
 			} else if msg.content == "$asy:reboot" {
-				handle_err(msg.reply_ping(&context.http, "cya!").await);
+				handle_err(msg.reply_ping(&ctx.http, "cya!").await);
 				std::process::exit(0);
 			}
 		}
-		if msg.content.len() > 11 {
-			let mut start_offset = 0;
-			let mut values = vec![];
-			// check for embedded ```asyl\n…```’s
-			while let Some(start_idx) = msg.content[start_offset..].find("```asyl\n") {
-				let off = start_offset + start_idx + 8;
-				if let Some(end_idx) = msg.content[off..].find("```") {
-					values.push(msg.content[off..off + end_idx].trim());
-					start_offset = off + end_idx + 3;
-				} else {
-					break
-				}
-			}
-			if values.len() > 0 {
-				eval_print(&context, &msg, &values.join("\n")).await;
-			}
-		}
+		trigger_modules!(ctx);
 	}
-	async fn ready(context: Context, ready: Ready) {
+	async fn message_delete(
+		_ctx: Context,
+		_channel_id: ChannelId,
+		_deleted_message_id: MessageId,
+		_guild_id: Option<GuildId>,
+	) auto
+	async fn message_delete_bulk(
+		_ctx: Context,
+		_channel_id: ChannelId,
+		_multiple_deleted_messages_ids: Vec<MessageId>,
+		_guild_id: Option<GuildId>,
+	) auto
+	async fn message_update(
+		_ctx: Context,
+		_old_if_available: Option<Message>,
+		_new: Option<Message>,
+		_event: MessageUpdateEvent,
+	) auto
+	async fn reaction_add(_ctx: Context, _add_reaction: Reaction) auto
+	async fn reaction_remove(_ctx: Context, _removed_reaction: Reaction) auto
+	async fn reaction_remove_all(
+		_ctx: Context,
+		_channel_id: ChannelId,
+		_removed_from_message_id: MessageId,
+	) auto
+	async fn presence_replace(_ctx: Context, _data: Vec<Presence>) auto
+	async fn presence_update(_ctx: Context, _new_data: PresenceUpdateEvent) auto
+	async fn ready(ctx: Context, ready: Ready) {
 		log::info!("logged in as {}", ready.user.name);
 		{
-			let lock = get_data(&context).await;
+			let lock = get_data(&ctx).await;
 			let mut global_data = lock.write().await;
 			global_data.user_id = ready.user.id.0;
 		}
+		trigger_modules!(ctx);
 	}
+	async fn resume(_ctx: Context, _resume: ResumedEvent) auto
+	async fn shard_stage_update(_ctx: Context, _data: ShardStageUpdateEvent) auto
+	async fn typing_start(_ctx: Context, _data: TypingStartEvent) auto
+	async fn unknown(_ctx: Context, _name: String, _raw: Value) auto
+	async fn user_update(_ctx: Context, _old_data: CurrentUser, _new: CurrentUser) auto
+	async fn voice_server_update(_ctx: Context, _data: VoiceServerUpdateEvent) auto
+	async fn voice_state_update(
+		_ctx: Context,
+		_guild: Option<GuildId>,
+		_old: Option<VoiceState>,
+		_new: VoiceState,
+	) auto
+	async fn webhook_update(
+		_ctx: Context,
+		_guild_id: GuildId,
+		_belongs_to_channel_id: ChannelId,
+	) auto
+	async fn stage_instance_create(_ctx: Context, _stage_instance: StageInstance) auto
+	async fn stage_instance_update(_ctx: Context, _stage_instance: StageInstance) auto
+	async fn stage_instance_delete(_ctx: Context, _stage_instance: StageInstance) auto
+	async fn thread_create(_ctx: Context, _thread: GuildChannel) auto
+	async fn thread_update(_ctx: Context, _thread: GuildChannel) auto
+	async fn thread_delete(_ctx: Context, _thread: PartialGuildChannel) auto
+	async fn thread_list_sync(_ctx: Context, _thread_list_sync: ThreadListSyncEvent) auto
+	async fn thread_member_update(_ctx: Context, _thread_member: ThreadMember) auto
+	async fn thread_members_update(
+		_ctx: Context,
+		_thread_members_update: ThreadMembersUpdateEvent,
+	) auto
 }
 
 #[tokio::main]

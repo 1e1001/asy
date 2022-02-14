@@ -1,18 +1,23 @@
 use std::iter;
 use std::ops::{RangeBounds, Bound};
+use std::str::Chars;
+
+use serenity::builder::CreateMessage;
+use serenity::client::Context;
+use serenity::model::id::ChannelId;
+use serenity::prelude::SerenityError;
+use serenity::model::channel::Message;
 
 pub fn safe_string(t: &str) -> String {
   let mut out = String::new();
   for ch in t.chars() {
-	match ch {
-	  '\\'|'*'|'_'|'`'|'>'|'<'|'~'|'|' => {
-		out.push('\\');
-	  },
-	  _ => {}
-	}
-	out.push(ch);
-  }
-  out
+		match ch {
+			'\\'|'*'|'_'|'`'|'>'|'<'|'~'|'|' => {
+			out.push('\\');
+			}, _ => {}
+		}
+		out.push(ch);
+  } out
 }
 
 pub type Dual = (Option<usize>, Option<usize>);
@@ -68,34 +73,107 @@ pub fn format_list(items: &[String], and: bool) -> String {
 	}
 }
 
-
-mod tests {
-	use crate::utils::{format_arg_range, range_to_dual};
-
-	#[test]
-	fn arg_range_tests() {
-		assert_eq!(format_arg_range(range_to_dual(0..)), "at least 0 arguments");
-		assert_eq!(format_arg_range(range_to_dual(1..)), "at least 1 argument");
-		assert_eq!(format_arg_range(range_to_dual(2..)), "at least 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(..1)), "0 arguments");
-		assert_eq!(format_arg_range(range_to_dual(..2)), "0 – 1 argument");
-		assert_eq!(format_arg_range(range_to_dual(..3)), "0 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(..=1)), "0 – 1 argument");
-		assert_eq!(format_arg_range(range_to_dual(..=2)), "0 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(..=3)), "0 – 3 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..=0)), "0 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..=1)), "0 – 1 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..=2)), "0 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(1..=1)), "1 argument");
-		assert_eq!(format_arg_range(range_to_dual(1..=2)), "1 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(1..=3)), "1 – 3 arguments");
-		assert_eq!(format_arg_range(range_to_dual(2..=2)), "2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..1)), "0 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..2)), "0 – 1 arguments");
-		assert_eq!(format_arg_range(range_to_dual(0..3)), "0 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(1..2)), "1 argument");
-		assert_eq!(format_arg_range(range_to_dual(1..3)), "1 – 2 arguments");
-		assert_eq!(format_arg_range(range_to_dual(1..4)), "1 – 3 arguments");
-		assert_eq!(format_arg_range(range_to_dual(2..3)), "2 arguments");
+pub fn fuck_err<T, E: std::error::Error>(f: Result<T, E>) -> Option<T> {
+	match f {
+		Ok(v) => Some(v),
+		Err(e) => {
+			log::error!("internal error: {}", e);
+			None
+		},
 	}
 }
+
+pub enum PagerLocation {
+	Reply(Message),
+	Post(ChannelId),
+}
+
+impl PagerLocation {
+	async fn post(&self, context: &Context, content: &str) -> Result<Message, SerenityError> {
+		self.post_fn(context, |m| {
+			m.content(content);
+			m
+		}).await
+	}
+	fn get_channel(&self) -> (ChannelId, Option<&Message>) {
+		match self {
+			PagerLocation::Reply(msg) => (msg.channel_id, Some(msg)),
+			PagerLocation::Post(channel) => (*channel, None),
+		}
+	}
+	fn no_reply(&self) -> Self {
+		PagerLocation::Post(self.get_channel().0)
+	}
+	async fn post_fn<'a, F>(&self, context: &Context, content: F) -> Result<Message, SerenityError>
+	where for<'b> F: FnOnce(&'b mut CreateMessage<'a>) -> &'b mut CreateMessage<'a>{
+		let (channel, reference) = self.get_channel();
+		channel.send_message(&context.http, |m| {
+			if let Some(msg) = reference {
+				m.reference_message(msg);
+			}
+			content(m);
+			m
+		}).await
+	}
+}
+
+pub async fn pager(context: &Context, content: &str, location: &PagerLocation) -> Result<(), SerenityError> {
+	const MAX_LEN: usize = 1998;
+	fn append_line(line: Chars, len: usize, pages: &mut Vec<String>, line_len: &mut usize) {
+		if len + *line_len > MAX_LEN {
+			if pages.len() > 0 {
+				pages[pages.len() - 1].push('…');
+			}
+			if len > MAX_LEN {
+				pages.push(line.take(MAX_LEN).collect::<String>());
+				*line_len = MAX_LEN;
+				append_line(line, len - MAX_LEN, pages, line_len);
+			} else {
+				let mut data = line.collect::<String>();
+				data.push('\n');
+				pages.push(data);
+				*line_len = len + 1;
+			}
+		} else if pages.len() > 0 {
+			let mut data = line.collect::<String>();
+			data.push('\n');
+			pages[pages.len() - 1].push_str(&data);
+			*line_len += len + 1;
+		} else {
+			let mut data = line.collect::<String>();
+			data.push('\n');
+			pages.push(data);
+			*line_len = len + 1;
+		}
+	}
+	let mut pages = vec![];
+	let mut page_len = 0;
+	for line in content.lines() {
+		// we need to create the iterator twice unfortunately
+		let len = line.chars().count();
+		append_line(line.chars(), len, &mut pages, &mut page_len);
+	}
+	let mut iter = pages.iter();
+	match iter.next() {
+		Some(v) => location.post(context, v).await?,
+		None => {
+			location.post(context, "\u{00AD}").await?;
+			return Ok(())
+		}
+	};
+	let location = location.no_reply();
+	for page in iter {
+		location.post(context, page).await?;
+	}
+	Ok(())
+}
+
+// async fn edit_or_reply(cache: impl CacheHttp, edit: Option<Message>, reply: &Message, c: impl fmt::Display) -> serenity::Result<()> {
+// 	match edit {
+// 		Some(mut v) => v.edit(cache, |m| m.content(c)).await,
+// 		None => {
+// 			reply.reply_ping(cache, c).await?;
+// 			Ok(())
+// 		},
+// 	}
+// }

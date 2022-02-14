@@ -273,6 +273,8 @@ fn parse_number(data: &str, span: AsylSpan) -> AsylResult<AsylExpr> {
 	let mut exp_len = 0u8;
 	let mut exp_neg = false;
 	// i could rewrite this as a consume-y thingy like the tokenizer but i dont feel like it
+	// however, TODO: make this a .chars().map(Some).chain(iter::once(None)) and handle eof for each state
+	// also use new numbers
 	for ch in data.chars() {
 		match state {
 			ParseState::IntSign => match ch {

@@ -10,15 +10,14 @@ use super::scope::{AsylScope, AsylEnv};
 
 #[derive(Debug, Clone)]
 pub enum AsylType {
-	Symbol, String, Float, Int, Bool, Type, List, Fn, Null
+	Symbol, String, Number, Bool, Type, List, Fn, Null
 }
 impl fmt::Display for AsylType {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(match self {
 			AsylType::Symbol => "'symbol",
 			AsylType::String => "'string",
-			AsylType::Float  => "'float",
-			AsylType::Int    => "'int",
+			AsylType::Number  => "'number",
 			AsylType::Bool   => "'bool",
 			AsylType::Type   => "'type",
 			AsylType::List   => "'list",
@@ -39,8 +38,7 @@ pub struct AsylLambda {
 pub enum AsylExprValue {
 	Symbol(MappedStr),
 	String(MappedStr),
-	Float(f64),
-	Int(i64),
+	Number(f64), // todo: number type
 	Bool(bool),
 	Type(AsylType),
 	// todo
@@ -61,8 +59,7 @@ impl fmt::Debug for AsylExprValue {
 		match self {
 			Self::Symbol(a) => f.debug_tuple("Symbol").field(a).finish(),
 			Self::String(a) => f.debug_tuple("String").field(a).finish(),
-			Self::Float(a) => f.debug_tuple("Float").field(a).finish(),
-			Self::Int(a) => f.debug_tuple("Int").field(a).finish(),
+			Self::Number(a) => f.debug_tuple("Number").field(a).finish(),
 			Self::Bool(a) => f.debug_tuple("Bool").field(a).finish(),
 			Self::Type(a) => f.debug_tuple("Type").field(a).finish(),
 			Self::List(a) => f.debug_tuple("List").field(a).finish(),
@@ -77,8 +74,7 @@ impl AsylExprValue {
 		match self {
 			AsylExprValue::Symbol(_) => AsylType::Symbol,
 			AsylExprValue::String(_) => AsylType::String,
-			AsylExprValue::Float(_)  => AsylType::Float,
-			AsylExprValue::Int(_)    => AsylType::Int,
+			AsylExprValue::Number(_)  => AsylType::Number,
 			AsylExprValue::Bool(_)   => AsylType::Bool,
 			AsylExprValue::Type(_)   => AsylType::Type,
 			AsylExprValue::List(_)   => AsylType::List,
@@ -98,8 +94,7 @@ impl fmt::Display for AsylExpr {
 		f.write_str(&match &self.0 {
 			AsylExprValue::Symbol(v) => v.to_string(),
 			AsylExprValue::String(v) => format!("{:?}", v.to_string()),
-			AsylExprValue::Float(v) => v.to_string(),
-			AsylExprValue::Int(v) => v.to_string(),
+			AsylExprValue::Number(v) => v.to_string(),
 			// technically 't and 'f are just variables but i don't care
 			AsylExprValue::Bool(v) => if *v {"'t"} else {"'f"}.to_string(),
 			AsylExprValue::List(v) => format!("({})", v.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")),

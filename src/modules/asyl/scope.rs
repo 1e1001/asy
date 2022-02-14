@@ -70,19 +70,3 @@ impl AsylScope for AsylLambdaScope {
 		Some(&self.parent)
 	}
 }
-#[derive(Debug)]
-pub struct AsylRootScope {
-	data: HashMap<MappedStr, BTreeMap<usize, AsylScopeEntry>>,
-}
-impl AsylScope for AsylRootScope {
-	fn get_ring(&self, name: &MappedStr) -> Option<&BTreeMap<usize, AsylScopeEntry>> {
-		self.data.get(name)
-	}
-	fn set_var(&mut self, name: MappedStr, index: usize, value: AsylScopeEntry) {
-		let ent = self.data.entry(name).or_insert_with(|| BTreeMap::new());
-		ent.insert(index, value);
-	}
-	fn get_parent(&self) -> Option<&Arc<RwLock<dyn AsylScope>>> {
-		None
-	}
-}

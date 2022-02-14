@@ -6,10 +6,11 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.52"
 async-recursion = "1.0.0"
-serenity = { version = "0.10.10", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+serenity = { version = "0.10.10", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache"] }
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 log = "0.4.14"
 env_logger = "0.9.0"
 serde = { version = "1.0.136", features = ["derive"] }
 toml = "0.5.8"
 hex = "0.4.3"
+serde_json = "1.0.78"
